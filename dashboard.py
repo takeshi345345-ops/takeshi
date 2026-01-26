@@ -10,7 +10,7 @@ import datetime
 
 # --- 0. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴台股快報 (庫存優先版)",
+    page_title="總柴台股快報 (修復版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -33,7 +33,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 標題已更改為柴犬 ---
 st.title("🐕 總柴台股快報：庫存優先監控")
 
 # --- 1. 初始化 Session State ---
@@ -91,6 +90,12 @@ with st.sidebar:
     force_send_clicked = st.button("🔥 強制發送快報", type="primary")
     if force_send_clicked and not line_token:
         st.error("請先輸入 Token！")
+        
+    if st.button("測試連線"):
+        if line_token:
+            s, c, m = send_line_broadcast(line_token, "🐕 總柴台股快報：測試連線 OK")
+            if s: st.toast("測試成功")
+            else: st.error(f"失敗: {m}")
 
     st.divider()
     st.subheader("庫存")
@@ -107,7 +112,6 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
     code_map = {}
     sector_map = {}
     
-    # 建立對照表
     for p in user_portfolio:
         if p:
             code_map[p], sector_map[p] = f"庫存({p})", "💼 我的庫存"
@@ -145,14 +149,11 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
             signal, code = "🛡️ 觀望", 0
             pct_fmt = f"+{pct}%" if pct > 0 else f"{pct}%"
             
-            # 判斷是否為庫存
             is_inv = sid in user_portfolio
             
-            # --- 訊號邏輯 ---
             if price > ma20:
                 if vol_ratio < 0.8 and pct > -3 and abs(bias) < 4:
                     signal, code = "👍 推薦買進 (量縮回測)", 10
-                    # 庫存特別標註
                     prefix = "🔴 [加碼]" if is_inv else "🔴"
                     item = {
                         'sector': sector,
@@ -191,7 +192,6 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
             }
         except: return None
 
-    # 第一輪
     for sid in target_list:
         ticker = f"{sid}.TW"
         df = pd.DataFrame()
@@ -203,7 +203,6 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
             res = analyze(df, sid, code_map[sid], sector_map[sid])
             if res: results.append(res)
             
-    # 第二輪
     if failed_codes:
         two_tickers = [f"{x}.TWO" for x in failed_codes]
         try:
@@ -221,94 +220,60 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
         
     return pd.DataFrame(results), buy_signals, sell_signals
 
-# --- 6. 執行掃描 ---
-# --- 載入動畫文字也更改為柴犬 ---
 with st.spinner("🐕 總柴正在幫你掃描全產業..."):
     df, buy_list, sell_list = scan_all_sectors(selected_sectors, portfolio)
 
-# --- 7. 發送邏輯 (庫存優先 + 族群分類) ---
-
 def build_grouped_message(data_list, title):
     if not data_list: return ""
-    
-    # 依照族群分組
     grouped = {}
     for item in data_list:
-        # 如果是庫存，不加入一般族群分組 (避免重複顯示在下方)
         if item['is_inv']: continue 
-        
         sec = item['sector']
         if sec not in grouped: grouped[sec] = []
         grouped[sec].append(item['msg'])
-        
     msg = f"\n{title} (共{len(data_list)}檔)\n"
-    
     for sec, items in grouped.items():
         msg += f"\n[{sec}]\n"
         msg += "\n".join(items) + "\n"
-        
     return msg
 
 def build_full_notify():
-    # 1. 提取庫存訊號
     my_inv_msgs = []
-    
-    # 從買進清單找庫存
     for item in buy_list:
         if item['is_inv']: my_inv_msgs.append(item['msg'])
-        
-    # 從賣出清單找庫存
     for item in sell_list:
         if item['is_inv']: my_inv_msgs.append(item['msg'])
-        
     now_str = datetime.datetime.now().strftime('%H:%M')
-    # --- LINE 通知標題更改為柴犬 ---
     final_msg = f"🐕 總柴台股快報 | {now_str}\n==================\n"
-    
-    # A. 庫存區塊 (最優先)
     if my_inv_msgs:
         final_msg += "\n【💼 庫存關鍵快報】\n"
         final_msg += "\n".join(my_inv_msgs) + "\n"
-        final_msg += "-"*20 + "\n" # 分隔線
-        
-    # B. 市場買進區塊 (依照族群)
+        final_msg += "-"*20 + "\n"
     if buy_list:
         final_msg += build_grouped_message(buy_list, "【👍 市場推薦買進】")
-        
-    # C. 市場賣出區塊 (依照族群)
     if sell_list:
         final_msg += build_grouped_message(sell_list, "【👎 市場推薦賣出】")
-        
     return final_msg
 
-# 檢查是否發送
 if line_token and (buy_list or sell_list):
-    
     msg_to_send = build_full_notify()
-    
-    # A. 強制發送
     if force_send_clicked:
         msg_to_send = "🔴 [強制發送] " + msg_to_send
         success, code, err = send_line_broadcast(line_token, msg_to_send)
         if success: st.toast("✅ 強制發送成功！", icon="🚀")
         else: st.error(f"發送失敗: {err}")
-
-    # B. 自動排程
     elif enable_notify:
         now = datetime.datetime.now()
         start = now.replace(hour=8, minute=45, second=0, microsecond=0)
         end = now.replace(hour=13, minute=30, second=0, microsecond=0)
-        
         should_send = False
         if start <= now <= end:
             if st.session_state.daily_notify_count < 3:
                 time_diff = 999
                 if st.session_state.last_notify_time:
                     time_diff = (now - st.session_state.last_notify_time).total_seconds() / 60
-                
                 if st.session_state.last_notify_time is None or time_diff >= 90:
                     should_send = True
-        
         if should_send:
             success, code, err = send_line_broadcast(line_token, msg_to_send)
             if success:
@@ -316,7 +281,6 @@ if line_token and (buy_list or sell_list):
                 st.session_state.last_notify_time = now
                 st.toast(f"✅ 自動通知已發送")
 
-# --- 狀態顯示 ---
 next_msg = "隨時可發"
 if st.session_state.last_notify_time:
     next_run = st.session_state.last_notify_time + datetime.timedelta(minutes=90)
@@ -327,8 +291,6 @@ st.markdown(f"""
     🔔 自動排程: {st.session_state.daily_notify_count}/3 次 | {next_msg}
 </div>
 """, unsafe_allow_html=True)
-
-# --- 8. 介面呈現 ---
 
 if df.empty:
     st.error("無法取得數據，請檢查網路。")
@@ -349,7 +311,6 @@ else:
                     </div>
                     """, unsafe_allow_html=True)
 
-    # --- 副標題更改為柴犬 ---
     st.subheader(f"🐕 總柴全產業訊號 ({len(df)} 檔)")
     t1, t2, t3, t4 = st.tabs(["👍 推薦買進", "👎 推薦賣出", "🔥 資金排行", "全部"])
     cols = ['名稱', '族群', '現價', '漲幅', '量比', '訊號']
@@ -368,6 +329,7 @@ else:
     with t4:
         st.dataframe(df, column_order=cols, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key="t4")
 
+    # --- 這裡開始是「點擊圖表」的修復邏輯 ---
     sel = None
     if st.session_state.t1.selection.rows: sel = d1.iloc[st.session_state.t1.selection.rows[0]]
     elif st.session_state.t2.selection.rows: sel = d2.iloc[st.session_state.t2.selection.rows[0]]
@@ -380,34 +342,54 @@ else:
         st.divider()
         st.markdown(f"### 📈 {name} ({sid})")
         
+        # 1. 先抓股價 (K線)
+        chart_df = pd.DataFrame()
         try:
             chart_df = yf.download(f"{sid}.TW", period="9mo", progress=False)
             if chart_df.empty: chart_df = yf.download(f"{sid}.TWO", period="9mo", progress=False)
             if isinstance(chart_df.columns, pd.MultiIndex): chart_df.columns = chart_df.columns.get_level_values(0)
             
-            chart_df['MA5'] = chart_df['Close'].rolling(5).mean()
-            chart_df['MA20'] = chart_df['Close'].rolling(20).mean()
-            
+            if not chart_df.empty:
+                chart_df['MA5'] = chart_df['Close'].rolling(5).mean()
+                chart_df['MA20'] = chart_df['Close'].rolling(20).mean()
+            else:
+                st.warning(f"🐕 總柴找不到 {name} 的歷史股價，可能資料源有問題。")
+        except Exception as e:
+            st.error(f"股價載入失敗: {e}")
+
+        # 2. 再抓融券 (FinMind) - 獨立處理，不影響K線
+        short_data = pd.DataFrame()
+        try:
             dl = DataLoader()
             short_data = dl.taiwan_stock_margin_purchase_short_sale(
                 stock_id=sid, start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime('%Y-%m-%d')
             )
-            
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.2, 0.3],
-                                subplot_titles=("K線 (橘=20MA)", "成交量", "融券(紅) vs 借券(黃)"))
-            
-            fig.add_trace(go.Candlestick(x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name='K線'), row=1, col=1)
-            fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA5'], name='5MA', line=dict(color='white', width=1)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA20'], name='20MA', line=dict(color='orange', width=2)), row=1, col=1)
-            
-            colors = ['red' if o < c else 'green' for o, c in zip(chart_df['Open'], chart_df['Close'])]
-            fig.add_trace(go.Bar(x=chart_df.index, y=chart_df['Volume'], name='量', marker_color=colors), row=2, col=1)
-            
-            if not short_data.empty:
-                val_m = short_data.get('ShortSaleBalance', short_data.iloc[:, -2] if len(short_data.columns)>2 else None)
-                if val_m is not None: fig.add_trace(go.Scatter(x=short_data['date'], y=val_m, name='融券', line=dict(color='red', width=2)), row=3, col=1)
-            
-            fig.update_layout(template="plotly_dark", height=700, xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig, use_container_width=True)
-            
-        except: st.error("圖表載入失敗")
+        except Exception as e:
+            # 融券失敗就算了，不跳錯誤，只在心裡默默難過
+            pass
+
+        # 3. 繪圖 (只要有 K 線就畫)
+        if not chart_df.empty:
+            try:
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.2, 0.3],
+                                    subplot_titles=("K線 (橘=20MA)", "成交量", "融券(紅) vs 借券(黃)"))
+                
+                # K線
+                fig.add_trace(go.Candlestick(x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name='K線'), row=1, col=1)
+                fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA5'], name='5MA', line=dict(color='white', width=1)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA20'], name='20MA', line=dict(color='orange', width=2)), row=1, col=1)
+                
+                # 成交量
+                colors = ['red' if o < c else 'green' for o, c in zip(chart_df['Open'], chart_df['Close'])]
+                fig.add_trace(go.Bar(x=chart_df.index, y=chart_df['Volume'], name='量', marker_color=colors), row=2, col=1)
+                
+                # 融券 (如果有抓到的話)
+                if not short_data.empty:
+                    val_m = short_data.get('ShortSaleBalance', short_data.iloc[:, -2] if len(short_data.columns)>2 else None)
+                    if val_m is not None: 
+                        fig.add_trace(go.Scatter(x=short_data['date'], y=val_m, name='融券', line=dict(color='red', width=2)), row=3, col=1)
+                
+                fig.update_layout(template="plotly_dark", height=700, xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"繪圖發生錯誤: {e}")
