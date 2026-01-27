@@ -3,11 +3,27 @@ import pandas as pd
 import twstock
 import time
 import datetime
+import requests
+import urllib3
 from FinMind.data import DataLoader
+
+# --- 🔥 暴力破解 SSL 憑證問題 (關鍵修正) ---
+# 告訴 Python：不要檢查證交所的憑證，直接連線！
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+old_merge_environment_settings = requests.Session.merge_environment_settings
+
+def merge_environment_settings(self, url, proxies, stream, verify, cert):
+    # 強制將 verify 設定為 False (不檢查 SSL)
+    if 'twse.com.tw' in url or 'mis.twse.com.tw' in url:
+        verify = False
+    return old_merge_environment_settings(self, url, proxies, stream, verify, cert)
+
+requests.Session.merge_environment_settings = merge_environment_settings
+# ---------------------------------------------
 
 # --- 0. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴台股快報 (自動補位版)",
+    page_title="總柴台股快報 (暴力破解版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -22,15 +38,13 @@ st.markdown("""
     .card-wait { border-left-color: #FFD700; }
     .ticker { font-size: 1.1rem; font-weight: bold; color: #fff; }
     .info { font-size: 0.9rem; color: #ccc; }
-    .sector-tag { font-size: 0.8rem; color: #00E5FF; background: #222; padding: 2px 6px; border-radius: 4px; margin-right: 5px; }
-    .notify-status { background: #333; padding: 10px; border-radius: 5px; text-align: center; color: #FFA500; font-weight: bold; margin-bottom: 20px; }
-    .error-box { background: #550000; padding: 10px; border-radius: 5px; color: #ffcccc; margin-bottom: 10px; }
+    .error-box { background: #550000; padding: 10px; border-radius: 5px; color: #ffcccc; margin-bottom: 10px; font-size: 0.8rem;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐕 總柴台股快報：自動補位監控")
+st.title("🐕 總柴台股快報：終極修復版")
 
-# --- 1. 自動讀取 Token (免輸入) ---
+# --- 1. Token ---
 LINE_TOKEN = None
 if "LINE_TOKEN" in st.secrets:
     LINE_TOKEN = st.secrets["LINE_TOKEN"]
@@ -38,7 +52,7 @@ else:
     with st.sidebar:
         LINE_TOKEN = st.text_input("輸入 LINE Token", type="password")
 
-# --- 2. 產業與庫存設定 ---
+# --- 2. 資料庫 ---
 SECTOR_DB = {
     "🔥 半導體": {'2330':'台積電','2454':'聯發科','2303':'聯電','3711':'日月光','3034':'聯詠','2379':'瑞昱','3443':'創意','3661':'世芯-KY','3035':'智原','3529':'力旺','6531':'愛普','3189':'景碩','8046':'南電','3037':'欣興','8299':'群聯','3260':'威剛','2408':'南亞科','4966':'譜瑞','6104':'創惟','6415':'矽力','6756':'威鋒','2344':'華邦電','2337':'旺宏','6271':'同欣電','5269':'祥碩','8016':'矽創','8131':'福懋科'},
     "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢','3483':'力致'},
@@ -55,16 +69,11 @@ SECTOR_DB = {
 
 with st.sidebar:
     st.header("⚙️ 設定")
-    st.divider()
-    st.subheader("庫存")
     inv = st.text_area("代號", "2330, 2603")
     portfolio = [x.strip() for x in inv.split(",") if x.strip()]
-    
-    st.divider()
     all_sectors = list(SECTOR_DB.keys())
     selected_sectors = st.multiselect("掃描族群", all_sectors, default=all_sectors)
 
-# --- 3. LINE 發送 ---
 def send_line(msg):
     if not LINE_TOKEN: return False, "No Token"
     import requests, json
@@ -77,8 +86,6 @@ def send_line(msg):
     except Exception as e:
         return False, str(e)
 
-# --- 4. 掃描函式 ---
-
 def get_targets(user_port, sectors):
     target_codes = set(user_port)
     code_info = {p: {'name': f"庫存({p})", 'sector': '💼 我的庫存', 'is_inv': True} for p in user_port}
@@ -89,78 +96,90 @@ def get_targets(user_port, sectors):
                 code_info[code] = {'name': name, 'sector': sec, 'is_inv': False}
     return list(target_codes), code_info
 
-def scan_yesterday(target_codes, code_info):
-    # FinMind 抓昨天收盤 (穩定的備案)
+# --- A. 備援方案：FinMind (修正版) ---
+def scan_yesterday_finmind(target_codes, code_info):
     dl = DataLoader()
     start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime('%Y-%m-%d')
-    
     results, buy_sigs, sell_sigs = [], [], []
     
-    # 這裡我們用一個更高效的方法：一次抓全市場日資料，然後篩選
-    # 避免一個一個抓太慢
-    try:
-        # 嘗試抓最近幾天的全市場資料
-        dates = [datetime.datetime.now() - datetime.timedelta(days=x) for x in range(10)]
-        df_all = pd.DataFrame()
+    # 修正錯誤：不能用 date=... 抓全市場，改用迴圈抓個股
+    bar = st.progress(0, text="🐕 啟動備援 FinMind (逐檔掃描)...")
+    
+    # 為了速度，我們只抓前 20 檔代表 (雲端資源有限)
+    # 或是分批抓
+    count = 0
+    total = len(target_codes)
+    
+    for sid in target_codes:
+        count += 1
+        if count % 5 == 0: bar.progress(min(count/total, 0.9))
         
-        for d in dates:
-            d_str = d.strftime('%Y-%m-%d')
-            temp = dl.taiwan_stock_daily(date=d_str)
-            if not temp.empty:
-                df_all = temp
-                break # 抓到最近一天有資料的就停
-        
-        if df_all.empty:
-            return pd.DataFrame(), [], []
-
-        # 篩選我們關注的股票
-        df_target = df_all[df_all['stock_id'].isin(target_codes)].copy()
-        
-        for index, row in df_target.iterrows():
-            sid = row['stock_id']
-            price = float(row['close'])
-            # 昨收沒給，我們簡單算 MA20 比較難，這裡簡化策略
-            # 改用 "強勢股" 判斷：成交量大 + 漲幅大
-            # FinMind 日資料沒給漲跌幅，要自己算，太慢
-            # 這裡做一個簡單展示：列出價格
+        try:
+            # 正確寫法：指定 stock_id
+            stock_data = dl.taiwan_stock_daily(stock_id=sid, start_date=start_date)
+            if stock_data.empty or len(stock_data) < 20: continue
+            
+            curr = stock_data.iloc[-1]
+            prev = stock_data.iloc[-2]
+            
+            price = float(curr['close'])
+            prev_price = float(prev['close'])
+            
+            # 簡單算 MA20
+            stock_data['MA20'] = stock_data['close'].rolling(20).mean()
+            ma20 = stock_data.iloc[-1]['MA20']
+            
+            pct = round(((price - prev_price)/prev_price)*100, 2)
             
             name = code_info.get(sid, {}).get('name', sid)
             is_inv = code_info.get(sid, {}).get('is_inv', False)
             sec = code_info.get(sid, {}).get('sector', '')
             
-            results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': 0, '訊號': '昨日收盤(FinMind)'})
+            msg = None
+            signal = "昨收"
+            if price > ma20 and pct > 2:
+                msg = f"🔴 {name} ${price} (+{pct}%) 🔥昨轉強"
+                buy_sigs.append({'msg': msg, 'is_inv': is_inv, 'sector': sec})
+                signal = "🔥轉強"
+            elif price < ma20 and pct < -2:
+                msg = f"🟢 {name} ${price} ({pct}%) 📉昨破線"
+                sell_sigs.append({'msg': msg, 'is_inv': is_inv, 'sector': sec})
+                signal = "📉破線"
+                
+            results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': signal})
             
-    except Exception as e:
-        st.error(f"FinMind 備援失敗: {e}")
-        
+        except Exception as e:
+            pass # 跳過失敗的
+            
+    bar.empty()
     return pd.DataFrame(results), buy_sigs, sell_sigs
 
-
+# --- B. 主要方案：Twstock 即時 (含 SSL 破解) ---
 def scan_realtime(target_codes, code_info):
-    # 用 twstock 抓即時
     results, buy_sigs, sell_sigs = [], [], []
-    bar = st.progress(0, text="🐕 嘗試連線證交所 (即時)...")
+    bar = st.progress(0, text="🐕 暴力連線證交所 (SSL已忽略)...")
+    error_msg = None
     
-    BATCH = 10 # 縮小批次，比較不會錯
-    error_log = []
+    BATCH = 10
+    has_success = False
     
     for i in range(0, len(target_codes), BATCH):
         batch = target_codes[i:i+BATCH]
         try:
+            # twstock 會使用我們上面修改過的 requests，所以不會報 SSL 錯
             stocks = twstock.realtime.get(batch)
             if stocks:
                 for sid, data in stocks.items():
                     if data['success']:
+                        has_success = True
                         rt = data['realtime']
-                        # 處理價格為 - 的情況 (收盤後常見)
                         try:
                             price = float(rt['latest_trade_price'])
                         except:
-                            # 試著拿最後一筆成交 或 買賣價
                             try:
                                 if rt.get('best_bid_price'): price = float(rt['best_bid_price'][0])
-                                else: price = 0
-                            except: price = 0
+                                else: continue
+                            except: continue
                             
                         if price == 0: continue
                         
@@ -182,50 +201,41 @@ def scan_realtime(target_codes, code_info):
                             sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%)", 'is_inv': is_inv, 'sector': sec})
                             
                         results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': signal})
-                    else:
-                        error_log.append(f"{sid}: {data.get('rtmessage', 'Unknown error')}")
             
             bar.progress(min((i+BATCH)/len(target_codes), 0.9))
-            time.sleep(1) # 休息一下
+            time.sleep(1)
         except Exception as e:
-            error_log.append(f"Batch Error: {e}")
-            pass
+            error_msg = str(e)
             
     bar.empty()
     
-    # 如果完全沒資料，回傳錯誤讓外面知道
-    if not results and error_log:
-        st.markdown(f"<div class='error-box'>即時資料抓取失敗 (可能被擋或收盤格式變更): {error_log[0]}</div>", unsafe_allow_html=True)
-        return None, [], [] # 回傳 None 代表失敗
+    if not has_success:
+        if error_msg: st.markdown(f"<div class='error-box'>即時連線失敗: {error_msg}</div>", unsafe_allow_html=True)
+        return None, [], []
         
     return pd.DataFrame(results), buy_sigs, sell_sigs
 
-# --- 6. 核心按鈕與顯示 ---
-
-# 大大的手動按鈕
+# --- 主程式 ---
 if st.button("🔍 立即手動更新", type="primary"):
     targets, info = get_targets(portfolio, selected_sectors)
     
-    # 1. 先試即時
+    # 1. 嘗試即時 (已加強 SSL 通過率)
     df, buys, sells = scan_realtime(targets, info)
     
-    # 2. 如果失敗 (df is None)，自動切換備援
+    # 2. 如果還是失敗，切換到修正後的 FinMind
     if df is None or df.empty:
-        st.warning("⚠️ 即時連線失敗，自動切換至 [FinMind 昨日收盤數據] 進行顯示")
-        df, buys, sells = scan_yesterday(targets, info)
+        st.warning("⚠️ 即時連線受阻，切換至 [FinMind 昨日備援] 模式")
+        df, buys, sells = scan_yesterday_finmind(targets, info)
         
-    # 3. 顯示結果
+    # 3. 顯示
     if not df.empty:
-        st.success(f"掃描完成！共 {len(df)} 筆資料")
+        st.success(f"掃描完成！共 {len(df)} 筆")
         
-        # 庫存特別顯示
         if portfolio:
             st.subheader("💼 我的庫存")
-            my_df = df[df['代號'].isin(portfolio)]
-            st.dataframe(my_df, hide_index=True)
+            st.dataframe(df[df['代號'].isin(portfolio)], hide_index=True)
             
-        st.subheader("全市場掃描")
-        # 簡單分類
+        st.subheader("市場掃描")
         col1, col2 = st.columns(2)
         with col1:
             st.caption("🔥 漲幅排行")
@@ -234,15 +244,10 @@ if st.button("🔍 立即手動更新", type="primary"):
             st.caption("📉 跌幅排行")
             st.dataframe(df.sort_values('漲幅', ascending=True).head(20), hide_index=True)
             
-        # 發送 LINE 測試
-        if buys or sells:
-            st.info(f"發現訊號：{len(buys)} 買進, {len(sells)} 賣出")
-            if LINE_TOKEN:
-                msg = f"🐕 總柴手動更新測試\n"
-                for b in buys[:5]: msg += f"{b['msg']}\n"
-                if len(buys) > 5: msg += f"...等 {len(buys)} 檔\n"
-                send_line(msg)
+        if (buys or sells) and LINE_TOKEN:
+            msg = f"🐕 總柴測試發送\n"
+            for b in buys[:3]: msg += f"{b['msg']}\n"
+            send_line(msg)
+            st.toast("測試通知已發送")
     else:
-        st.error("❌ 所有資料來源皆無法讀取，請檢查網路或稍後再試。")
-
-st.info("💡 說明：此版本優先抓取即時資料，若失敗會自動切換抓昨日收盤，確保一定有資料可看。")
+        st.error("❌ 所有資料來源皆無法使用，請稍後再試。")
