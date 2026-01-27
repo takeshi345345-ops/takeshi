@@ -1,17 +1,13 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from FinMind.data import DataLoader
-import requests
-import json
+import twstock
+import time
 import datetime
-import time # 新增時間模組，用來休息
+from FinMind.data import DataLoader
 
 # --- 0. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴台股快報 (分批搬運版)",
+    page_title="總柴台股快報 (三班制)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -20,36 +16,44 @@ st.markdown("""
 <style>
     .stApp { background-color: #000000; color: #FFFFFF; }
     h1, h2, h3 { color: #00E5FF !important; }
-    
     .stock-card { padding: 12px; margin-bottom: 8px; border-radius: 6px; border-left: 6px solid #555; background: #1a1a1a; }
     .card-buy { border-left-color: #FF00FF; }
     .card-sell { border-left-color: #00FF00; }
     .card-wait { border-left-color: #FFD700; }
-    
     .ticker { font-size: 1.1rem; font-weight: bold; color: #fff; }
     .info { font-size: 0.9rem; color: #ccc; }
     .sector-tag { font-size: 0.8rem; color: #00E5FF; background: #222; padding: 2px 6px; border-radius: 4px; margin-right: 5px; }
-    
     .notify-status { background: #333; padding: 10px; border-radius: 5px; text-align: center; color: #FFA500; font-weight: bold; margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐕 總柴台股快報：庫存優先監控")
+st.title("🐕 總柴台股快報：三班制監控")
 
-# --- 1. 初始化 Session State ---
-if 'daily_notify_count' not in st.session_state:
-    st.session_state.daily_notify_count = 0
-if 'last_notify_time' not in st.session_state:
-    st.session_state.last_notify_time = None
-if 'last_notify_date' not in st.session_state:
-    st.session_state.last_notify_date = datetime.date.today()
+# --- 1. 自動讀取 Token (免輸入) ---
+LINE_TOKEN = None
+if "LINE_TOKEN" in st.secrets:
+    LINE_TOKEN = st.secrets["LINE_TOKEN"]
+else:
+    # 如果沒設定 Secrets，才顯示輸入框
+    with st.sidebar:
+        st.warning("💡 提示：去 Streamlit 後台設定 Secrets 就可以免輸入密碼喔！")
+        LINE_TOKEN = st.text_input("輸入 LINE Token", type="password")
 
-if st.session_state.last_notify_date != datetime.date.today():
-    st.session_state.daily_notify_count = 0
-    st.session_state.last_notify_time = None
-    st.session_state.last_notify_date = datetime.date.today()
+# --- 2. 初始化狀態 (紀錄今天有沒有發過) ---
+if 'last_run_date' not in st.session_state:
+    st.session_state.last_run_date = datetime.date.today()
+    st.session_state.done_830 = False
+    st.session_state.done_915 = False
+    st.session_state.done_1230 = False
 
-# --- 2. 內建核心資料庫 (850+ 檔) ---
+# 跨日重置
+if st.session_state.last_run_date != datetime.date.today():
+    st.session_state.last_run_date = datetime.date.today()
+    st.session_state.done_830 = False
+    st.session_state.done_915 = False
+    st.session_state.done_1230 = False
+
+# --- 3. 產業與庫存設定 ---
 SECTOR_DB = {
     "🔥 半導體": {'2330':'台積電','2454':'聯發科','2303':'聯電','3711':'日月光','3034':'聯詠','2379':'瑞昱','3443':'創意','3661':'世芯-KY','3035':'智原','3529':'力旺','6531':'愛普','3189':'景碩','8046':'南電','3037':'欣興','8299':'群聯','3260':'威剛','2408':'南亞科','4966':'譜瑞','6104':'創惟','6415':'矽力','6756':'威鋒','2344':'華邦電','2337':'旺宏','6271':'同欣電','5269':'祥碩','8016':'矽創','8131':'福懋科'},
     "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢','3483':'力致'},
@@ -64,378 +68,197 @@ SECTOR_DB = {
     "📈 ETF": {'0050':'0050','0056':'0056','00878':'00878','00929':'00929','00940':'00940','00919':'00919','00632R':'反1','00679B':'美債'}
 }
 
-# --- 3. LINE 通知功能 ---
-def send_line_broadcast(access_token, text_msg):
-    url = "https://api.line.me/v2/bot/message/broadcast"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-    payload = {"messages": [{"type": "text", "text": text_msg}]}
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload))
-        return r.status_code == 200, r.status_code, r.text
-    except Exception as e:
-        return False, 0, str(e)
-
-# --- 4. 側邊欄設定 ---
 with st.sidebar:
     st.header("⚙️ 設定")
-    if st.button("🔄 刷新數據"): st.cache_data.clear()
-    
-    st.divider()
-    st.subheader("🤖 LINE 設定")
-    line_token = st.text_input("Channel Access Token", type="password")
-    
-    col_auto, col_force = st.columns(2)
-    with col_auto:
-        enable_notify = st.checkbox("自動排程 (開盤3次)", value=True)
-    
-    force_send_clicked = st.button("🔥 強制發送快報", type="primary")
-    if force_send_clicked and not line_token:
-        st.error("請先輸入 Token！")
-        
-    if st.button("測試連線"):
-        if line_token:
-            s, c, m = send_line_broadcast(line_token, "🐕 總柴台股快報：測試連線 OK")
-            if s: st.toast("測試成功")
-            else: st.error(f"失敗: {m}")
-
+    auto_refresh = st.toggle("啟動自動監控", value=True, help="開啟後，網頁會自動刷新檢查時間")
     st.divider()
     st.subheader("庫存")
-    inv = st.text_area("代號 (逗號分隔)", "2330, 2603")
+    inv = st.text_area("代號", "2330, 2603")
     portfolio = [x.strip() for x in inv.split(",") if x.strip()]
     
     st.divider()
     all_sectors = list(SECTOR_DB.keys())
     selected_sectors = st.multiselect("掃描族群", all_sectors, default=all_sectors)
 
-# --- 偽裝用 Session ---
-def get_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
-    return session
+# --- 4. LINE 發送 ---
+def send_line(msg):
+    if not LINE_TOKEN: return False, "No Token"
+    import requests, json
+    url = "https://api.line.me/v2/bot/message/broadcast"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"}
+    payload = {"messages": [{"type": "text", "text": msg}]}
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload))
+        return r.status_code == 200, r.text
+    except Exception as e:
+        return False, str(e)
 
-# --- 5. 核心掃描 (分批處理版) ---
-@st.cache_data(ttl=60, show_spinner=False)
-def scan_all_sectors(sectors_to_scan, user_portfolio):
-    code_map = {}
-    sector_map = {}
-    
-    for p in user_portfolio:
-        if p:
-            code_map[p], sector_map[p] = f"庫存({p})", "💼 我的庫存"
-    for sec in sectors_to_scan:
+# --- 5. 掃描函式 (A. 昨日數據 B. 即時數據) ---
+
+def get_targets(user_port, sectors):
+    target_codes = set(user_port)
+    code_info = {p: {'name': f"庫存({p})", 'sector': '💼 我的庫存', 'is_inv': True} for p in user_port}
+    for sec in sectors:
         for code, name in SECTOR_DB[sec].items():
-            code_map[code], sector_map[code] = name, sec
-            
-    target_list = list(code_map.keys())
-    tw_tickers = [f"{x}.TW" for x in target_list]
-    
-    # --- 關鍵修正：分批下載 (Batching) ---
-    session = get_session()
-    all_dfs = []
-    
-    # 設定每一批的數量 (建議 30-50，太高會被擋)
-    BATCH_SIZE = 30
-    
-    # 建立進度條
-    progress_text = "🐕 總柴努力搬運資料中..."
-    my_bar = st.progress(0, text=progress_text)
-    
-    total_batches = (len(tw_tickers) // BATCH_SIZE) + 1
-    
-    for i in range(0, len(tw_tickers), BATCH_SIZE):
-        batch = tw_tickers[i : i + BATCH_SIZE]
-        if not batch: continue
-        
-        try:
-            # 更新進度
-            current_batch_num = (i // BATCH_SIZE) + 1
-            my_bar.progress(min(current_batch_num / total_batches, 1.0), text=f"{progress_text} ({current_batch_num}/{total_batches})")
-            
-            # 下載這批
-            batch_df = yf.download(batch, period="1mo", group_by='ticker', progress=False, session=session, threads=False)
-            if not batch_df.empty:
-                all_dfs.append(batch_df)
-                
-            # 休息一下，避免被 Yahoo 發現是機器人
-            time.sleep(0.5) 
-            
-        except Exception as e:
-            print(f"Batch failed: {e}")
-            pass
-            
-    my_bar.empty() # 跑完後隱藏進度條
-    
-    # 合併所有資料
-    data_tw = pd.DataFrame()
-    if all_dfs:
-        try:
-            data_tw = pd.concat(all_dfs, axis=1)
-        except:
-            data_tw = pd.DataFrame()
-        
-    results = []
-    buy_signals = [] 
-    sell_signals = []
-    failed_codes = []
-    
-    def analyze(df, sid, name, sector):
-        try:
-            df = df.dropna(subset=['Close'])
-            if len(df) < 20: return None
-            df['MA20'] = df['Close'].rolling(20).mean()
-            
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
-            price = float(curr['Close'])
-            ma20 = float(curr['MA20'])
-            pct = round(((price - float(prev['Close'])) / float(prev['Close'])) * 100, 2)
-            vol = int(curr['Volume'])
-            vol_avg = float(df['Volume'].tail(5).mean())
-            vol_ratio = round(vol / vol_avg, 1) if vol_avg > 0 else 0
-            bias = ((price - ma20) / ma20) * 100
-            
-            signal, code = "🛡️ 觀望", 0
-            pct_fmt = f"+{pct}%" if pct > 0 else f"{pct}%"
-            
-            is_inv = sid in user_portfolio
-            
-            if price > ma20:
-                if vol_ratio < 0.8 and pct > -3 and abs(bias) < 4:
-                    signal, code = "👍 推薦買進 (量縮回測)", 10
-                    prefix = "🔴 [加碼]" if is_inv else "🔴"
-                    item = {
-                        'sector': sector,
-                        'is_inv': is_inv,
-                        'msg': f"{prefix} {name}({sid}) ${price} ({pct_fmt})\n   └ 量縮回測 (量比{vol_ratio})"
-                    }
-                    buy_signals.append(item)
-                    
-                elif vol_ratio > 1.5 and pct > 2:
-                    signal, code = "👍 推薦買進 (帶量攻擊)", 10
-                    prefix = "🔴 [加碼]" if is_inv else "🔴"
-                    item = {
-                        'sector': sector,
-                        'is_inv': is_inv,
-                        'msg': f"{prefix} {name}({sid}) ${price} ({pct_fmt})\n   └ 🔥爆量攻擊 (量比{vol_ratio})"
-                    }
-                    buy_signals.append(item)
-                else:
-                    signal, code = "👀 多頭觀察", 2
-            else:
-                if pct < 0:
-                    signal, code = "👎 推薦賣出 (破線)", -10
-                    prefix = "🟢 [減碼]" if is_inv else "🟢"
-                    item = {
-                        'sector': sector,
-                        'is_inv': is_inv,
-                        'msg': f"{prefix} {name}({sid}) ${price} ({pct_fmt})\n   └ 📉破線轉弱"
-                    }
-                    sell_signals.append(item)
-                else:
-                    signal, code = "❄️ 反彈無力", -1
-            
-            return {
-                "代號": sid, "名稱": name, "族群": sector, "現價": price, "漲幅": pct, 
-                "量比": vol_ratio, "訊號": signal, "code": code, "MA20": round(ma20, 2)
-            }
-        except: return None
+            target_codes.add(code)
+            if code not in code_info:
+                code_info[code] = {'name': name, 'sector': sec, 'is_inv': False}
+    return list(target_codes), code_info
 
-    for sid in target_list:
-        ticker = f"{sid}.TW"
-        df = pd.DataFrame()
-        if len(tw_tickers)==1 and not data_tw.empty: df = data_tw
-        elif ticker in data_tw: df = data_tw[ticker]
-        
-        if df.empty or 'Close' not in df.columns or df['Close'].isna().all(): failed_codes.append(sid)
-        else:
-            res = analyze(df, sid, code_map[sid], sector_map[sid])
-            if res: results.append(res)
-            
-    # 上櫃股也要分批抓 (雖然數量少，但以防萬一)
-    if failed_codes:
-        two_tickers = [f"{x}.TWO" for x in failed_codes]
-        # 上櫃股數量少，一次抓應該還好，但我們還是加個 session
+def scan_yesterday(target_codes, code_info):
+    # 用 FinMind 抓昨天收盤 (08:30 用)
+    dl = DataLoader()
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=45)).strftime('%Y-%m-%d')
+    
+    results, buy_sigs, sell_sigs = [], [], []
+    
+    # 這裡只抓大盤與幾個代表性的，為了效率我們用簡單策略：抓每檔個股最近30日
+    # 因為 FinMind 免費版限制，我們這裡模擬「盤前掃描」
+    # 為了不卡頓，這裡用 twstock 抓歷史 (因為是盤前，不會被即時擋)
+    
+    bar = st.progress(0, text="🐕 盤前掃描中 (昨日收盤數據)...")
+    for i, sid in enumerate(target_codes):
+        if i % 5 == 0: bar.progress(min(i/len(target_codes), 0.9))
         try:
-            data_two = yf.download(two_tickers, period="1mo", group_by='ticker', progress=False, session=session)
-            for sid in failed_codes:
-                ticker = f"{sid}.TWO"
-                df = pd.DataFrame()
-                if len(two_tickers)==1 and not data_two.empty: df = data_two
-                elif ticker in data_two: df = data_two[ticker]
-                
-                if not df.empty and 'Close' in df.columns and not df['Close'].isna().all():
-                    res = analyze(df, sid, code_map[sid], sector_map[sid])
-                    if res: results.append(res)
+            stock = twstock.Stock(sid)
+            data = stock.fetch_from(2023, 1) # 其實只抓最近就好，twstock 會自動優化
+            if len(stock.price) < 20: continue
+            
+            price = stock.price[-1]
+            prev = stock.price[-2]
+            ma20 = sum(stock.price[-20:]) / 20
+            
+            pct = round(((price - prev)/prev)*100, 2)
+            vol_ratio = 1.0 # 簡化
+            
+            # 策略
+            name = code_info[sid]['name']
+            is_inv = code_info[sid]['is_inv']
+            sec = code_info[sid]['sector']
+            
+            msg = None
+            if price > ma20:
+                if pct > 2.5: 
+                    msg = f"🔴 {name} ${price} (+{pct}%) 🔥昨日轉強"
+                    buy_sigs.append({'msg': msg, 'is_inv': is_inv, 'sector': sec})
+            else:
+                if pct < -2:
+                    msg = f"🟢 {name} ${price} ({pct}%) 📉昨日破線"
+                    sell_sigs.append({'msg': msg, 'is_inv': is_inv, 'sector': sec})
+            
+            results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': '昨日數據'})
         except: pass
         
-    return pd.DataFrame(results), buy_signals, sell_signals
+    bar.empty()
+    return pd.DataFrame(results), buy_sigs, sell_sigs
 
-# --- 執行 ---
-# 這裡不需要 with st.spinner，因為我們裡面有自製進度條
-df, buy_list, sell_list = scan_all_sectors(selected_sectors, portfolio)
-
-def build_grouped_message(data_list, title):
-    if not data_list: return ""
-    grouped = {}
-    for item in data_list:
-        if item['is_inv']: continue 
-        sec = item['sector']
-        if sec not in grouped: grouped[sec] = []
-        grouped[sec].append(item['msg'])
-    msg = f"\n{title} (共{len(data_list)}檔)\n"
-    for sec, items in grouped.items():
-        msg += f"\n[{sec}]\n"
-        msg += "\n".join(items) + "\n"
-    return msg
-
-def build_full_notify():
-    my_inv_msgs = []
-    for item in buy_list:
-        if item['is_inv']: my_inv_msgs.append(item['msg'])
-    for item in sell_list:
-        if item['is_inv']: my_inv_msgs.append(item['msg'])
-    now_str = datetime.datetime.now().strftime('%H:%M')
-    final_msg = f"🐕 總柴台股快報 | {now_str}\n==================\n"
-    if my_inv_msgs:
-        final_msg += "\n【💼 庫存關鍵快報】\n"
-        final_msg += "\n".join(my_inv_msgs) + "\n"
-        final_msg += "-"*20 + "\n"
-    if buy_list:
-        final_msg += build_grouped_message(buy_list, "【👍 市場推薦買進】")
-    if sell_list:
-        final_msg += build_grouped_message(sell_list, "【👎 市場推薦賣出】")
-    return final_msg
-
-if line_token and (buy_list or sell_list):
-    msg_to_send = build_full_notify()
-    if force_send_clicked:
-        msg_to_send = "🔴 [強制發送] " + msg_to_send
-        success, code, err = send_line_broadcast(line_token, msg_to_send)
-        if success: st.toast("✅ 強制發送成功！", icon="🚀")
-        else: st.error(f"發送失敗: {err}")
-    elif enable_notify:
-        now = datetime.datetime.now()
-        start = now.replace(hour=8, minute=45, second=0, microsecond=0)
-        end = now.replace(hour=13, minute=30, second=0, microsecond=0)
-        should_send = False
-        if start <= now <= end:
-            if st.session_state.daily_notify_count < 3:
-                time_diff = 999
-                if st.session_state.last_notify_time:
-                    time_diff = (now - st.session_state.last_notify_time).total_seconds() / 60
-                if st.session_state.last_notify_time is None or time_diff >= 90:
-                    should_send = True
-        if should_send:
-            success, code, err = send_line_broadcast(line_token, msg_to_send)
-            if success:
-                st.session_state.daily_notify_count += 1
-                st.session_state.last_notify_time = now
-                st.toast(f"✅ 自動通知已發送")
-
-next_msg = "隨時可發"
-if st.session_state.last_notify_time:
-    next_run = st.session_state.last_notify_time + datetime.timedelta(minutes=90)
-    next_msg = f"冷卻中 (預計 {next_run.strftime('%H:%M')})"
+def scan_realtime(target_codes, code_info):
+    # 用 twstock 抓即時 (09:15, 12:30 用)
+    results, buy_sigs, sell_sigs = [], [], []
+    bar = st.progress(0, text="🐕 盤中即時掃描中...")
     
-st.markdown(f"""
-<div class="notify-status">
-    🔔 自動排程: {st.session_state.daily_notify_count}/3 次 | {next_msg}
-</div>
-""", unsafe_allow_html=True)
+    BATCH = 20
+    for i in range(0, len(target_codes), BATCH):
+        batch = target_codes[i:i+BATCH]
+        try:
+            stocks = twstock.realtime.get(batch)
+            if stocks:
+                for sid, data in stocks.items():
+                    if data['success']:
+                        rt = data['realtime']
+                        price = float(rt['latest_trade_price']) if rt['latest_trade_price'] != '-' else 0
+                        if price == 0: continue
+                        prev = float(rt['previous_close'])
+                        pct = round(((price-prev)/prev)*100, 2)
+                        
+                        name = code_info[sid]['name']
+                        is_inv = code_info[sid]['is_inv']
+                        sec = code_info[sid]['sector']
+                        
+                        # 簡單策略：漲跌幅 > 2%
+                        if pct > 2.5:
+                            buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%) 🔥即時攻擊", 'is_inv': is_inv, 'sector': sec})
+                        elif pct < -2:
+                            sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%) 📉即時急殺", 'is_inv': is_inv, 'sector': sec})
+                            
+                        results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': '即時'})
+            bar.progress(min((i+BATCH)/len(target_codes), 0.9))
+            time.sleep(1)
+        except: pass
+    bar.empty()
+    return pd.DataFrame(results), buy_sigs, sell_sigs
 
-if df.empty:
-    st.error("無法取得數據 (Yahoo 阻擋)，建議稍後重試或檢查網路。")
-else:
-    if portfolio:
-        with st.expander("💼 我的庫存", expanded=True):
-            my_df = df[df['代號'].isin(portfolio)]
-            if not my_df.empty:
-                for row in my_df.itertuples():
-                    cls = "card-buy" if row.code==10 else "card-sell" if row.code==-10 else "card-wait"
-                    color = "#FF4444" if row.漲幅 > 0 else "#00FF00"
-                    st.markdown(f"""
-                    <div class="stock-card {cls}">
-                        <div class="ticker">{row.名稱} ({row.代號}) <span class="sector-tag">{row.族群}</span></div>
-                        <div class="info">
-                            {row.訊號} | 價: {row.現價} (<span style="color:{color}">{row.漲幅}%</span>) | 量比: {row.量比}
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+# --- 6. 核心邏輯控制 ---
 
-    st.subheader(f"🐕 總柴全產業訊號 ({len(df)} 檔)")
-    t1, t2, t3, t4 = st.tabs(["👍 推薦買進", "👎 推薦賣出", "🔥 資金排行", "全部"])
-    cols = ['名稱', '族群', '現價', '漲幅', '量比', '訊號']
+# 大大的手動按鈕
+if st.button("🔍 立即手動更新 (抓即時)", type="primary"):
+    targets, info = get_targets(portfolio, selected_sectors)
+    df, buys, sells = scan_realtime(targets, info)
+    st.dataframe(df)
+    if buys or sells:
+        st.info("掃描到訊號！")
+
+# 自動排程邏輯
+now = datetime.datetime.now()
+current_time_str = now.strftime("%H:%M")
+
+targets, info = get_targets(portfolio, selected_sectors)
+msg_prefix = ""
+run_task = False
+df_res = pd.DataFrame()
+b_list, s_list = [], []
+
+# 檢查時間點
+# A. 08:30 盤前 (抓昨日)
+if now.hour == 8 and now.minute >= 30 and not st.session_state.done_830:
+    st.toast("⏰ 執行 08:30 盤前掃描...")
+    df_res, b_list, s_list = scan_yesterday(targets, info)
+    st.session_state.done_830 = True
+    msg_prefix = "🐕 總柴早報 (盤前篩選)"
+    run_task = True
+
+# B. 09:15 早盤 (抓即時)
+elif now.hour == 9 and now.minute >= 15 and not st.session_state.done_915:
+    st.toast("⏰ 執行 09:15 早盤衝刺...")
+    df_res, b_list, s_list = scan_realtime(targets, info)
+    st.session_state.done_915 = True
+    msg_prefix = "🐕 總柴早盤 (09:15)"
+    run_task = True
+
+# C. 12:30 午盤 (抓即時)
+elif now.hour == 12 and now.minute >= 30 and not st.session_state.done_1230:
+    st.toast("⏰ 執行 12:30 午盤結算...")
+    df_res, b_list, s_list = scan_realtime(targets, info)
+    st.session_state.done_1230 = True
+    msg_prefix = "🐕 總柴午盤 (12:30)"
+    run_task = True
+
+# 發送通知
+if run_task and (b_list or s_list):
+    final_msg = f"{msg_prefix} | {datetime.date.today()}\n"
     
-    with t1:
-        st.caption("條件：**股價 > 20MA** 且 (**量縮回測** 或 **帶量攻擊**)")
-        d1 = df[df['code'] == 10].sort_values('量比', ascending=True)
-        st.dataframe(d1, column_order=cols, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key="t1")
-    with t2:
-        st.caption("條件：**跌破 20MA**")
-        d2 = df[df['code'] <= -1].sort_values('漲幅', ascending=True)
-        st.dataframe(d2, column_order=cols, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key="t2")
-    with t3:
-        d3 = df.sort_values('現價', ascending=False)
-        st.dataframe(d3, column_order=cols, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key="t3")
-    with t4:
-        st.dataframe(df, column_order=cols, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key="t4")
-
-    sel = None
-    if st.session_state.t1.selection.rows: sel = d1.iloc[st.session_state.t1.selection.rows[0]]
-    elif st.session_state.t2.selection.rows: sel = d2.iloc[st.session_state.t2.selection.rows[0]]
-    elif st.session_state.t3.selection.rows: sel = d3.iloc[st.session_state.t3.selection.rows[0]]
-    elif st.session_state.t4.selection.rows: sel = df.iloc[st.session_state.t4.selection.rows[0]]
+    # 整理訊息
+    my_inv = [x['msg'] for x in b_list if x['is_inv']] + [x['msg'] for x in s_list if x['is_inv']]
+    others = [x['msg'] for x in b_list if not x['is_inv']] + [x['msg'] for x in s_list if not x['is_inv']]
     
-    if sel is not None:
-        sid = sel['代號']
-        name = sel['名稱']
-        st.divider()
-        st.markdown(f"### 📈 {name} ({sid})")
+    if my_inv:
+        final_msg += "\n【💼 庫存警示】\n" + "\n".join(my_inv) + "\n"
+    if others:
+        final_msg += "\n【👀 市場訊號】\n" + "\n".join(others[:15]) # 最多顯示15檔避免洗版
+        if len(others) > 15: final_msg += f"\n...還有 {len(others)-15} 檔"
         
-        session = get_session()
-        chart_df = pd.DataFrame()
-        try:
-            chart_df = yf.download(f"{sid}.TW", period="9mo", progress=False, session=session)
-            if chart_df.empty: chart_df = yf.download(f"{sid}.TWO", period="9mo", progress=False, session=session)
-            if isinstance(chart_df.columns, pd.MultiIndex): chart_df.columns = chart_df.columns.get_level_values(0)
-            
-            if not chart_df.empty:
-                chart_df['MA5'] = chart_df['Close'].rolling(5).mean()
-                chart_df['MA20'] = chart_df['Close'].rolling(20).mean()
-            else:
-                st.warning(f"🐕 總柴找不到 {name} 的歷史股價，可能資料源有問題。")
-        except Exception as e:
-            st.error(f"股價載入失敗: {e}")
+    success, res = send_line(final_msg)
+    if success: st.success(f"✅ {msg_prefix} 已發送")
+    else: st.error(f"發送失敗: {res}")
 
-        short_data = pd.DataFrame()
-        try:
-            dl = DataLoader()
-            short_data = dl.taiwan_stock_margin_purchase_short_sale(
-                stock_id=sid, start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime('%Y-%m-%d')
-            )
-        except Exception as e:
-            pass
+# 狀態顯示
+st.divider()
+st.markdown(f"**🕒 現在時間**: {current_time_str}")
+col1, col2, col3 = st.columns(3)
+col1.metric("08:30 盤前", "已執行" if st.session_state.done_830 else "待命")
+col2.metric("09:15 早盤", "已執行" if st.session_state.done_915 else "待命")
+col3.metric("12:30 午盤", "已執行" if st.session_state.done_1230 else "待命")
 
-        if not chart_df.empty:
-            try:
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.2, 0.3],
-                                    subplot_titles=("K線 (橘=20MA)", "成交量", "融券(紅) vs 借券(黃)"))
-                
-                fig.add_trace(go.Candlestick(x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name='K線'), row=1, col=1)
-                fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA5'], name='5MA', line=dict(color='white', width=1)), row=1, col=1)
-                fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA20'], name='20MA', line=dict(color='orange', width=2)), row=1, col=1)
-                
-                colors = ['red' if o < c else 'green' for o, c in zip(chart_df['Open'], chart_df['Close'])]
-                fig.add_trace(go.Bar(x=chart_df.index, y=chart_df['Volume'], name='量', marker_color=colors), row=2, col=1)
-                
-                if not short_data.empty:
-                    val_m = short_data.get('ShortSaleBalance', short_data.iloc[:, -2] if len(short_data.columns)>2 else None)
-                    if val_m is not None: 
-                        fig.add_trace(go.Scatter(x=short_data['date'], y=val_m, name='融券', line=dict(color='red', width=2)), row=3, col=1)
-                
-                fig.update_layout(template="plotly_dark", height=700, xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"繪圖發生錯誤: {e}")
+if auto_refresh:
+    time.sleep(30) # 每30秒檢查一次時間
+    st.rerun()
