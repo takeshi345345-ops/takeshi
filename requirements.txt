@@ -3,6 +3,5 @@ pandas
 plotly
 finmind
 requests
-tqdm
 twstock
 lxml
