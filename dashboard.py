@@ -7,10 +7,11 @@ from FinMind.data import DataLoader
 import requests
 import json
 import datetime
+import time # 新增時間模組，用來休息
 
 # --- 0. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴台股快報 (防擋版)",
+    page_title="總柴台股快報 (分批搬運版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -106,7 +107,7 @@ with st.sidebar:
     all_sectors = list(SECTOR_DB.keys())
     selected_sectors = st.multiselect("掃描族群", all_sectors, default=all_sectors)
 
-# --- 關鍵修正：建立偽裝用的 Session ---
+# --- 偽裝用 Session ---
 def get_session():
     session = requests.Session()
     session.headers.update({
@@ -114,7 +115,7 @@ def get_session():
     })
     return session
 
-# --- 5. 核心掃描 ---
+# --- 5. 核心掃描 (分批處理版) ---
 @st.cache_data(ttl=60, show_spinner=False)
 def scan_all_sectors(sectors_to_scan, user_portfolio):
     code_map = {}
@@ -130,14 +131,49 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
     target_list = list(code_map.keys())
     tw_tickers = [f"{x}.TW" for x in target_list]
     
-    # 使用偽裝 Session 來下載
+    # --- 關鍵修正：分批下載 (Batching) ---
     session = get_session()
+    all_dfs = []
     
-    try: 
-        # 這裡將 session 傳入 yf.download (新版 yfinance 支援)
-        data_tw = yf.download(tw_tickers, period="1mo", group_by='ticker', progress=False, session=session)
-    except: 
-        data_tw = pd.DataFrame()
+    # 設定每一批的數量 (建議 30-50，太高會被擋)
+    BATCH_SIZE = 30
+    
+    # 建立進度條
+    progress_text = "🐕 總柴努力搬運資料中..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total_batches = (len(tw_tickers) // BATCH_SIZE) + 1
+    
+    for i in range(0, len(tw_tickers), BATCH_SIZE):
+        batch = tw_tickers[i : i + BATCH_SIZE]
+        if not batch: continue
+        
+        try:
+            # 更新進度
+            current_batch_num = (i // BATCH_SIZE) + 1
+            my_bar.progress(min(current_batch_num / total_batches, 1.0), text=f"{progress_text} ({current_batch_num}/{total_batches})")
+            
+            # 下載這批
+            batch_df = yf.download(batch, period="1mo", group_by='ticker', progress=False, session=session, threads=False)
+            if not batch_df.empty:
+                all_dfs.append(batch_df)
+                
+            # 休息一下，避免被 Yahoo 發現是機器人
+            time.sleep(0.5) 
+            
+        except Exception as e:
+            print(f"Batch failed: {e}")
+            pass
+            
+    my_bar.empty() # 跑完後隱藏進度條
+    
+    # 合併所有資料
+    data_tw = pd.DataFrame()
+    if all_dfs:
+        try:
+            data_tw = pd.concat(all_dfs, axis=1)
+        except:
+            data_tw = pd.DataFrame()
         
     results = []
     buy_signals = [] 
@@ -217,11 +253,11 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
             res = analyze(df, sid, code_map[sid], sector_map[sid])
             if res: results.append(res)
             
-    # 第二輪 (.TWO)
+    # 上櫃股也要分批抓 (雖然數量少，但以防萬一)
     if failed_codes:
         two_tickers = [f"{x}.TWO" for x in failed_codes]
+        # 上櫃股數量少，一次抓應該還好，但我們還是加個 session
         try:
-            # 這裡也要加上 session
             data_two = yf.download(two_tickers, period="1mo", group_by='ticker', progress=False, session=session)
             for sid in failed_codes:
                 ticker = f"{sid}.TWO"
@@ -236,8 +272,9 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
         
     return pd.DataFrame(results), buy_signals, sell_signals
 
-with st.spinner("🐕 總柴正在幫你掃描全產業..."):
-    df, buy_list, sell_list = scan_all_sectors(selected_sectors, portfolio)
+# --- 執行 ---
+# 這裡不需要 with st.spinner，因為我們裡面有自製進度條
+df, buy_list, sell_list = scan_all_sectors(selected_sectors, portfolio)
 
 def build_grouped_message(data_list, title):
     if not data_list: return ""
@@ -309,7 +346,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if df.empty:
-    st.error("無法取得數據 (可能被Yahoo擋IP)，請稍後再試。")
+    st.error("無法取得數據 (Yahoo 阻擋)，建議稍後重試或檢查網路。")
 else:
     if portfolio:
         with st.expander("💼 我的庫存", expanded=True):
@@ -357,7 +394,7 @@ else:
         st.divider()
         st.markdown(f"### 📈 {name} ({sid})")
         
-        session = get_session() # 這裡繪圖也用 session
+        session = get_session()
         chart_df = pd.DataFrame()
         try:
             chart_df = yf.download(f"{sid}.TW", period="9mo", progress=False, session=session)
