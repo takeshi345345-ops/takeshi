@@ -10,7 +10,7 @@ import datetime
 
 # --- 0. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴台股快報 (修復版)",
+    page_title="總柴台股快報 (防擋版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -51,7 +51,7 @@ if st.session_state.last_notify_date != datetime.date.today():
 # --- 2. 內建核心資料庫 (850+ 檔) ---
 SECTOR_DB = {
     "🔥 半導體": {'2330':'台積電','2454':'聯發科','2303':'聯電','3711':'日月光','3034':'聯詠','2379':'瑞昱','3443':'創意','3661':'世芯-KY','3035':'智原','3529':'力旺','6531':'愛普','3189':'景碩','8046':'南電','3037':'欣興','8299':'群聯','3260':'威剛','2408':'南亞科','4966':'譜瑞','6104':'創惟','6415':'矽力','6756':'威鋒','2344':'華邦電','2337':'旺宏','6271':'同欣電','5269':'祥碩','8016':'矽創','8131':'福懋科'},
-    "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢'},
+    "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢','3483':'力致'},
     "📡 網通光電": {'2345':'智邦','5388':'中磊','3596':'智易','6285':'啟碁','4906':'正文','3704':'合勤控','3062':'建漢','2409':'友達','3481':'群創','6116':'彩晶','3008':'大立光','3406':'玉晶光','4961':'天鈺'},
     "⚡ 重電綠能": {'1513':'中興電','1519':'華城','1503':'士電','1514':'亞力','1609':'大亞','1605':'華新','1618':'合機','1603':'華電','6806':'森崴能源','3708':'上緯投控','9958':'世紀鋼','2031':'新光鋼','1504':'東元'},
     "🏗️ 營建資產": {'2501':'國建','2542':'興富發','2548':'華固','5522':'遠雄','2520':'冠德','2515':'中工','2538':'基泰','2505':'國揚','2547':'日勝生','5534':'長虹','2545':'皇翔','2537':'聯上發','9940':'信義'},
@@ -106,6 +106,14 @@ with st.sidebar:
     all_sectors = list(SECTOR_DB.keys())
     selected_sectors = st.multiselect("掃描族群", all_sectors, default=all_sectors)
 
+# --- 關鍵修正：建立偽裝用的 Session ---
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    return session
+
 # --- 5. 核心掃描 ---
 @st.cache_data(ttl=60, show_spinner=False)
 def scan_all_sectors(sectors_to_scan, user_portfolio):
@@ -122,8 +130,14 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
     target_list = list(code_map.keys())
     tw_tickers = [f"{x}.TW" for x in target_list]
     
-    try: data_tw = yf.download(tw_tickers, period="1mo", group_by='ticker', progress=False)
-    except: data_tw = pd.DataFrame()
+    # 使用偽裝 Session 來下載
+    session = get_session()
+    
+    try: 
+        # 這裡將 session 傳入 yf.download (新版 yfinance 支援)
+        data_tw = yf.download(tw_tickers, period="1mo", group_by='ticker', progress=False, session=session)
+    except: 
+        data_tw = pd.DataFrame()
         
     results = []
     buy_signals = [] 
@@ -203,10 +217,12 @@ def scan_all_sectors(sectors_to_scan, user_portfolio):
             res = analyze(df, sid, code_map[sid], sector_map[sid])
             if res: results.append(res)
             
+    # 第二輪 (.TWO)
     if failed_codes:
         two_tickers = [f"{x}.TWO" for x in failed_codes]
         try:
-            data_two = yf.download(two_tickers, period="1mo", group_by='ticker', progress=False)
+            # 這裡也要加上 session
+            data_two = yf.download(two_tickers, period="1mo", group_by='ticker', progress=False, session=session)
             for sid in failed_codes:
                 ticker = f"{sid}.TWO"
                 df = pd.DataFrame()
@@ -293,7 +309,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if df.empty:
-    st.error("無法取得數據，請檢查網路。")
+    st.error("無法取得數據 (可能被Yahoo擋IP)，請稍後再試。")
 else:
     if portfolio:
         with st.expander("💼 我的庫存", expanded=True):
@@ -329,7 +345,6 @@ else:
     with t4:
         st.dataframe(df, column_order=cols, use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key="t4")
 
-    # --- 這裡開始是「點擊圖表」的修復邏輯 ---
     sel = None
     if st.session_state.t1.selection.rows: sel = d1.iloc[st.session_state.t1.selection.rows[0]]
     elif st.session_state.t2.selection.rows: sel = d2.iloc[st.session_state.t2.selection.rows[0]]
@@ -342,11 +357,11 @@ else:
         st.divider()
         st.markdown(f"### 📈 {name} ({sid})")
         
-        # 1. 先抓股價 (K線)
+        session = get_session() # 這裡繪圖也用 session
         chart_df = pd.DataFrame()
         try:
-            chart_df = yf.download(f"{sid}.TW", period="9mo", progress=False)
-            if chart_df.empty: chart_df = yf.download(f"{sid}.TWO", period="9mo", progress=False)
+            chart_df = yf.download(f"{sid}.TW", period="9mo", progress=False, session=session)
+            if chart_df.empty: chart_df = yf.download(f"{sid}.TWO", period="9mo", progress=False, session=session)
             if isinstance(chart_df.columns, pd.MultiIndex): chart_df.columns = chart_df.columns.get_level_values(0)
             
             if not chart_df.empty:
@@ -357,7 +372,6 @@ else:
         except Exception as e:
             st.error(f"股價載入失敗: {e}")
 
-        # 2. 再抓融券 (FinMind) - 獨立處理，不影響K線
         short_data = pd.DataFrame()
         try:
             dl = DataLoader()
@@ -365,25 +379,20 @@ else:
                 stock_id=sid, start_date=(pd.Timestamp.now()-pd.Timedelta(days=120)).strftime('%Y-%m-%d')
             )
         except Exception as e:
-            # 融券失敗就算了，不跳錯誤，只在心裡默默難過
             pass
 
-        # 3. 繪圖 (只要有 K 線就畫)
         if not chart_df.empty:
             try:
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.2, 0.3],
                                     subplot_titles=("K線 (橘=20MA)", "成交量", "融券(紅) vs 借券(黃)"))
                 
-                # K線
                 fig.add_trace(go.Candlestick(x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name='K線'), row=1, col=1)
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA5'], name='5MA', line=dict(color='white', width=1)), row=1, col=1)
                 fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['MA20'], name='20MA', line=dict(color='orange', width=2)), row=1, col=1)
                 
-                # 成交量
                 colors = ['red' if o < c else 'green' for o, c in zip(chart_df['Open'], chart_df['Close'])]
                 fig.add_trace(go.Bar(x=chart_df.index, y=chart_df['Volume'], name='量', marker_color=colors), row=2, col=1)
                 
-                # 融券 (如果有抓到的話)
                 if not short_data.empty:
                     val_m = short_data.get('ShortSaleBalance', short_data.iloc[:, -2] if len(short_data.columns)>2 else None)
                     if val_m is not None: 
