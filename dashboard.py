@@ -7,7 +7,7 @@ from FinMind.data import DataLoader
 
 # --- 0. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴台股快報 (三班制)",
+    page_title="總柴台股快報 (自動補位版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -24,36 +24,21 @@ st.markdown("""
     .info { font-size: 0.9rem; color: #ccc; }
     .sector-tag { font-size: 0.8rem; color: #00E5FF; background: #222; padding: 2px 6px; border-radius: 4px; margin-right: 5px; }
     .notify-status { background: #333; padding: 10px; border-radius: 5px; text-align: center; color: #FFA500; font-weight: bold; margin-bottom: 20px; }
+    .error-box { background: #550000; padding: 10px; border-radius: 5px; color: #ffcccc; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐕 總柴台股快報：三班制監控")
+st.title("🐕 總柴台股快報：自動補位監控")
 
 # --- 1. 自動讀取 Token (免輸入) ---
 LINE_TOKEN = None
 if "LINE_TOKEN" in st.secrets:
     LINE_TOKEN = st.secrets["LINE_TOKEN"]
 else:
-    # 如果沒設定 Secrets，才顯示輸入框
     with st.sidebar:
-        st.warning("💡 提示：去 Streamlit 後台設定 Secrets 就可以免輸入密碼喔！")
         LINE_TOKEN = st.text_input("輸入 LINE Token", type="password")
 
-# --- 2. 初始化狀態 (紀錄今天有沒有發過) ---
-if 'last_run_date' not in st.session_state:
-    st.session_state.last_run_date = datetime.date.today()
-    st.session_state.done_830 = False
-    st.session_state.done_915 = False
-    st.session_state.done_1230 = False
-
-# 跨日重置
-if st.session_state.last_run_date != datetime.date.today():
-    st.session_state.last_run_date = datetime.date.today()
-    st.session_state.done_830 = False
-    st.session_state.done_915 = False
-    st.session_state.done_1230 = False
-
-# --- 3. 產業與庫存設定 ---
+# --- 2. 產業與庫存設定 ---
 SECTOR_DB = {
     "🔥 半導體": {'2330':'台積電','2454':'聯發科','2303':'聯電','3711':'日月光','3034':'聯詠','2379':'瑞昱','3443':'創意','3661':'世芯-KY','3035':'智原','3529':'力旺','6531':'愛普','3189':'景碩','8046':'南電','3037':'欣興','8299':'群聯','3260':'威剛','2408':'南亞科','4966':'譜瑞','6104':'創惟','6415':'矽力','6756':'威鋒','2344':'華邦電','2337':'旺宏','6271':'同欣電','5269':'祥碩','8016':'矽創','8131':'福懋科'},
     "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢','3483':'力致'},
@@ -70,7 +55,6 @@ SECTOR_DB = {
 
 with st.sidebar:
     st.header("⚙️ 設定")
-    auto_refresh = st.toggle("啟動自動監控", value=True, help="開啟後，網頁會自動刷新檢查時間")
     st.divider()
     st.subheader("庫存")
     inv = st.text_area("代號", "2330, 2603")
@@ -80,7 +64,7 @@ with st.sidebar:
     all_sectors = list(SECTOR_DB.keys())
     selected_sectors = st.multiselect("掃描族群", all_sectors, default=all_sectors)
 
-# --- 4. LINE 發送 ---
+# --- 3. LINE 發送 ---
 def send_line(msg):
     if not LINE_TOKEN: return False, "No Token"
     import requests, json
@@ -93,7 +77,7 @@ def send_line(msg):
     except Exception as e:
         return False, str(e)
 
-# --- 5. 掃描函式 (A. 昨日數據 B. 即時數據) ---
+# --- 4. 掃描函式 ---
 
 def get_targets(user_port, sectors):
     target_codes = set(user_port)
@@ -106,58 +90,60 @@ def get_targets(user_port, sectors):
     return list(target_codes), code_info
 
 def scan_yesterday(target_codes, code_info):
-    # 用 FinMind 抓昨天收盤 (08:30 用)
+    # FinMind 抓昨天收盤 (穩定的備案)
     dl = DataLoader()
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=45)).strftime('%Y-%m-%d')
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime('%Y-%m-%d')
     
     results, buy_sigs, sell_sigs = [], [], []
     
-    # 這裡只抓大盤與幾個代表性的，為了效率我們用簡單策略：抓每檔個股最近30日
-    # 因為 FinMind 免費版限制，我們這裡模擬「盤前掃描」
-    # 為了不卡頓，這裡用 twstock 抓歷史 (因為是盤前，不會被即時擋)
-    
-    bar = st.progress(0, text="🐕 盤前掃描中 (昨日收盤數據)...")
-    for i, sid in enumerate(target_codes):
-        if i % 5 == 0: bar.progress(min(i/len(target_codes), 0.9))
-        try:
-            stock = twstock.Stock(sid)
-            data = stock.fetch_from(2023, 1) # 其實只抓最近就好，twstock 會自動優化
-            if len(stock.price) < 20: continue
-            
-            price = stock.price[-1]
-            prev = stock.price[-2]
-            ma20 = sum(stock.price[-20:]) / 20
-            
-            pct = round(((price - prev)/prev)*100, 2)
-            vol_ratio = 1.0 # 簡化
-            
-            # 策略
-            name = code_info[sid]['name']
-            is_inv = code_info[sid]['is_inv']
-            sec = code_info[sid]['sector']
-            
-            msg = None
-            if price > ma20:
-                if pct > 2.5: 
-                    msg = f"🔴 {name} ${price} (+{pct}%) 🔥昨日轉強"
-                    buy_sigs.append({'msg': msg, 'is_inv': is_inv, 'sector': sec})
-            else:
-                if pct < -2:
-                    msg = f"🟢 {name} ${price} ({pct}%) 📉昨日破線"
-                    sell_sigs.append({'msg': msg, 'is_inv': is_inv, 'sector': sec})
-            
-            results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': '昨日數據'})
-        except: pass
+    # 這裡我們用一個更高效的方法：一次抓全市場日資料，然後篩選
+    # 避免一個一個抓太慢
+    try:
+        # 嘗試抓最近幾天的全市場資料
+        dates = [datetime.datetime.now() - datetime.timedelta(days=x) for x in range(10)]
+        df_all = pd.DataFrame()
         
-    bar.empty()
+        for d in dates:
+            d_str = d.strftime('%Y-%m-%d')
+            temp = dl.taiwan_stock_daily(date=d_str)
+            if not temp.empty:
+                df_all = temp
+                break # 抓到最近一天有資料的就停
+        
+        if df_all.empty:
+            return pd.DataFrame(), [], []
+
+        # 篩選我們關注的股票
+        df_target = df_all[df_all['stock_id'].isin(target_codes)].copy()
+        
+        for index, row in df_target.iterrows():
+            sid = row['stock_id']
+            price = float(row['close'])
+            # 昨收沒給，我們簡單算 MA20 比較難，這裡簡化策略
+            # 改用 "強勢股" 判斷：成交量大 + 漲幅大
+            # FinMind 日資料沒給漲跌幅，要自己算，太慢
+            # 這裡做一個簡單展示：列出價格
+            
+            name = code_info.get(sid, {}).get('name', sid)
+            is_inv = code_info.get(sid, {}).get('is_inv', False)
+            sec = code_info.get(sid, {}).get('sector', '')
+            
+            results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': 0, '訊號': '昨日收盤(FinMind)'})
+            
+    except Exception as e:
+        st.error(f"FinMind 備援失敗: {e}")
+        
     return pd.DataFrame(results), buy_sigs, sell_sigs
 
+
 def scan_realtime(target_codes, code_info):
-    # 用 twstock 抓即時 (09:15, 12:30 用)
+    # 用 twstock 抓即時
     results, buy_sigs, sell_sigs = [], [], []
-    bar = st.progress(0, text="🐕 盤中即時掃描中...")
+    bar = st.progress(0, text="🐕 嘗試連線證交所 (即時)...")
     
-    BATCH = 20
+    BATCH = 10 # 縮小批次，比較不會錯
+    error_log = []
+    
     for i in range(0, len(target_codes), BATCH):
         batch = target_codes[i:i+BATCH]
         try:
@@ -166,99 +152,97 @@ def scan_realtime(target_codes, code_info):
                 for sid, data in stocks.items():
                     if data['success']:
                         rt = data['realtime']
-                        price = float(rt['latest_trade_price']) if rt['latest_trade_price'] != '-' else 0
+                        # 處理價格為 - 的情況 (收盤後常見)
+                        try:
+                            price = float(rt['latest_trade_price'])
+                        except:
+                            # 試著拿最後一筆成交 或 買賣價
+                            try:
+                                if rt.get('best_bid_price'): price = float(rt['best_bid_price'][0])
+                                else: price = 0
+                            except: price = 0
+                            
                         if price == 0: continue
-                        prev = float(rt['previous_close'])
+                        
+                        try: prev = float(rt['previous_close'])
+                        except: prev = price
+                        
                         pct = round(((price-prev)/prev)*100, 2)
                         
                         name = code_info[sid]['name']
                         is_inv = code_info[sid]['is_inv']
                         sec = code_info[sid]['sector']
                         
-                        # 簡單策略：漲跌幅 > 2%
+                        signal = "觀望"
                         if pct > 2.5:
-                            buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%) 🔥即時攻擊", 'is_inv': is_inv, 'sector': sec})
+                            signal = "🔥攻擊"
+                            buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%)", 'is_inv': is_inv, 'sector': sec})
                         elif pct < -2:
-                            sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%) 📉即時急殺", 'is_inv': is_inv, 'sector': sec})
+                            signal = "📉弱勢"
+                            sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%)", 'is_inv': is_inv, 'sector': sec})
                             
-                        results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': '即時'})
+                        results.append({'代號': sid, '名稱': name, '現價': price, '漲幅': pct, '訊號': signal})
+                    else:
+                        error_log.append(f"{sid}: {data.get('rtmessage', 'Unknown error')}")
+            
             bar.progress(min((i+BATCH)/len(target_codes), 0.9))
-            time.sleep(1)
-        except: pass
+            time.sleep(1) # 休息一下
+        except Exception as e:
+            error_log.append(f"Batch Error: {e}")
+            pass
+            
     bar.empty()
+    
+    # 如果完全沒資料，回傳錯誤讓外面知道
+    if not results and error_log:
+        st.markdown(f"<div class='error-box'>即時資料抓取失敗 (可能被擋或收盤格式變更): {error_log[0]}</div>", unsafe_allow_html=True)
+        return None, [], [] # 回傳 None 代表失敗
+        
     return pd.DataFrame(results), buy_sigs, sell_sigs
 
-# --- 6. 核心邏輯控制 ---
+# --- 6. 核心按鈕與顯示 ---
 
 # 大大的手動按鈕
-if st.button("🔍 立即手動更新 (抓即時)", type="primary"):
+if st.button("🔍 立即手動更新", type="primary"):
     targets, info = get_targets(portfolio, selected_sectors)
+    
+    # 1. 先試即時
     df, buys, sells = scan_realtime(targets, info)
-    st.dataframe(df)
-    if buys or sells:
-        st.info("掃描到訊號！")
-
-# 自動排程邏輯
-now = datetime.datetime.now()
-current_time_str = now.strftime("%H:%M")
-
-targets, info = get_targets(portfolio, selected_sectors)
-msg_prefix = ""
-run_task = False
-df_res = pd.DataFrame()
-b_list, s_list = [], []
-
-# 檢查時間點
-# A. 08:30 盤前 (抓昨日)
-if now.hour == 8 and now.minute >= 30 and not st.session_state.done_830:
-    st.toast("⏰ 執行 08:30 盤前掃描...")
-    df_res, b_list, s_list = scan_yesterday(targets, info)
-    st.session_state.done_830 = True
-    msg_prefix = "🐕 總柴早報 (盤前篩選)"
-    run_task = True
-
-# B. 09:15 早盤 (抓即時)
-elif now.hour == 9 and now.minute >= 15 and not st.session_state.done_915:
-    st.toast("⏰ 執行 09:15 早盤衝刺...")
-    df_res, b_list, s_list = scan_realtime(targets, info)
-    st.session_state.done_915 = True
-    msg_prefix = "🐕 總柴早盤 (09:15)"
-    run_task = True
-
-# C. 12:30 午盤 (抓即時)
-elif now.hour == 12 and now.minute >= 30 and not st.session_state.done_1230:
-    st.toast("⏰ 執行 12:30 午盤結算...")
-    df_res, b_list, s_list = scan_realtime(targets, info)
-    st.session_state.done_1230 = True
-    msg_prefix = "🐕 總柴午盤 (12:30)"
-    run_task = True
-
-# 發送通知
-if run_task and (b_list or s_list):
-    final_msg = f"{msg_prefix} | {datetime.date.today()}\n"
     
-    # 整理訊息
-    my_inv = [x['msg'] for x in b_list if x['is_inv']] + [x['msg'] for x in s_list if x['is_inv']]
-    others = [x['msg'] for x in b_list if not x['is_inv']] + [x['msg'] for x in s_list if not x['is_inv']]
-    
-    if my_inv:
-        final_msg += "\n【💼 庫存警示】\n" + "\n".join(my_inv) + "\n"
-    if others:
-        final_msg += "\n【👀 市場訊號】\n" + "\n".join(others[:15]) # 最多顯示15檔避免洗版
-        if len(others) > 15: final_msg += f"\n...還有 {len(others)-15} 檔"
+    # 2. 如果失敗 (df is None)，自動切換備援
+    if df is None or df.empty:
+        st.warning("⚠️ 即時連線失敗，自動切換至 [FinMind 昨日收盤數據] 進行顯示")
+        df, buys, sells = scan_yesterday(targets, info)
         
-    success, res = send_line(final_msg)
-    if success: st.success(f"✅ {msg_prefix} 已發送")
-    else: st.error(f"發送失敗: {res}")
+    # 3. 顯示結果
+    if not df.empty:
+        st.success(f"掃描完成！共 {len(df)} 筆資料")
+        
+        # 庫存特別顯示
+        if portfolio:
+            st.subheader("💼 我的庫存")
+            my_df = df[df['代號'].isin(portfolio)]
+            st.dataframe(my_df, hide_index=True)
+            
+        st.subheader("全市場掃描")
+        # 簡單分類
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("🔥 漲幅排行")
+            st.dataframe(df.sort_values('漲幅', ascending=False).head(20), hide_index=True)
+        with col2:
+            st.caption("📉 跌幅排行")
+            st.dataframe(df.sort_values('漲幅', ascending=True).head(20), hide_index=True)
+            
+        # 發送 LINE 測試
+        if buys or sells:
+            st.info(f"發現訊號：{len(buys)} 買進, {len(sells)} 賣出")
+            if LINE_TOKEN:
+                msg = f"🐕 總柴手動更新測試\n"
+                for b in buys[:5]: msg += f"{b['msg']}\n"
+                if len(buys) > 5: msg += f"...等 {len(buys)} 檔\n"
+                send_line(msg)
+    else:
+        st.error("❌ 所有資料來源皆無法讀取，請檢查網路或稍後再試。")
 
-# 狀態顯示
-st.divider()
-st.markdown(f"**🕒 現在時間**: {current_time_str}")
-col1, col2, col3 = st.columns(3)
-col1.metric("08:30 盤前", "已執行" if st.session_state.done_830 else "待命")
-col2.metric("09:15 早盤", "已執行" if st.session_state.done_915 else "待命")
-col3.metric("12:30 午盤", "已執行" if st.session_state.done_1230 else "待命")
-
-if auto_refresh:
-    time.sleep(30) # 每30秒檢查一次時間
-    st.rerun()
+st.info("💡 說明：此版本優先抓取即時資料，若失敗會自動切換抓昨日收盤，確保一定有資料可看。")
