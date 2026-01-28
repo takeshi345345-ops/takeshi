@@ -5,6 +5,7 @@ import twstock
 import time
 import datetime
 import requests
+import json
 from FinMind.data import DataLoader
 
 # --- 1. 頁面設定 ---
@@ -45,27 +46,19 @@ with st.sidebar:
     inv_input = st.text_area("庫存代號 (免加.TW)", "8131")
     user_inv = [x.strip() for x in inv_input.split(",") if x.strip()]
     
-# --- 3. 股票池 (擴充至 400 檔重點股) ---
-# 包含各大類股龍頭、熱門成交重心
+# --- 3. 股票池 (400+ 檔) ---
 WATCHLIST_BASE = [
-    # 權值/半導體
-    '2330','2317','2454','2308','2303','2382','3231','2357','2376','2356','3037','3034','2379','3008',
+    '2330','2317','2454','2308','2382','3231','2357','2376','2356','3037','3034','2379','3008',
     '3045','2412','2345','3017','2324','6669','2395','4938','2408','3443','3661','2301','5871','2881',
-    # 金融
     '2882','2891','2886','2884','2885','2892','2880','2883','2890','5880','2887','2801',
-    # 航運/傳產
     '2603','2609','2615','2618','2610','2637','2606','2634','1513','1519','1503','1504','1605','1609',
     '1514','6806','9958','2031','1101','1216','2002','2105','2201','2207','1301','1303','1326','1402',
-    # 生技/化工
     '1476','9910','1722','1708','4743','1795','4128','6472','6446','6547','3293','3529','6531',
-    # 電子零組件/網通/光電
     '8046','8069','6274','6213','4958','6770','5347','6488','3035','3406','3596','3711','6239','6269',
     '8150','3324','3653','3665','3694','4919','4961','5269','5274','5483','6104','6121','6147','6187',
     '6223','6244','6271','6285','6414','6415','6456','6515','6643','6719','6756','8016','8028','8050',
     '8081','8112','8155','8299','8358','8436','8454','8464','8936','9921','9941','8131',
-    # ETF
     '0050','0056','00878','00929','00919','00632R',
-    # 其他熱門中小型
     '3019','2368','6214','6139','8021','6182','6202','5285','3680','3583','3036','3044','2455','2498',
     '2449','2404','2360','2352','2344','2313','2312','2302','2027','2014','2006','1907','1717','1710',
     '3481','2409','6116','2605','2614','1802','1904','1909'
@@ -74,66 +67,58 @@ WATCHLIST_BASE = [
 # --- 4. 核心功能模組 ---
 
 def get_chinese_name(sid):
-    # 用 twstock 查中文名，快速且不需連網
+    # twstock 查名
     if sid in twstock.codes:
         return twstock.codes[sid].name
     return sid
 
 def fetch_batch_price(tickers):
-    # 透過 Yahoo Finance 批次抓取價格與 MA20
-    # 這是目前最穩定的方法
+    # Yahoo Finance 批次抓取 (含MA20)
     yf_tickers = [f"{x}.TW" for x in tickers]
     try:
-        # 抓 3 個月確保 MA20 沒問題
         data = yf.download(yf_tickers, period="3mo", group_by='ticker', progress=False, threads=True)
         return data
     except:
         return None
 
 def get_chip_analysis(sid):
-    # 透過 FinMind 抓取法人籌碼 (外資+投信)
-    # 只抓最近 5 天，判斷趨勢
+    # FinMind 查籌碼 (需 tqdm 支援)
     try:
         dl = DataLoader()
         start = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
-        # FinMind 限制：免費版有時頻率限制，所以我們只對「有訊號」的股票查籌碼，不全查
+        # 抓法人買賣
         df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
         
         if df.empty: return "無數據", 0, 0
         
-        # 加總最近 3 天
-        recent = df.tail(3)
-        foreign_buy = recent['buy'].sum() - recent['sell'].sum() # 簡易算法，FinMind 欄位可能不同
-        
-        # 修正：FinMind 的欄位通常是 name, buy, sell. 需要篩選 "Foreign_Investor" 和 "Investment_Trust"
-        # 這裡為了簡化運算速度，我們抓總量或只要有數據就好
-        # 簡單邏輯：如果該日 buy > sell 就是買超
-        
-        # 更精準的做法：
+        # 簡單計算買賣超
+        # 注意：FinMind 免費版可能有資料延遲，若盤中無資料會抓到昨天的，這符合盤中參考趨勢
         df['net'] = df['buy'] - df['sell']
-        net_total = df['net'].tail(3).sum() # 近三日總買賣超
+        net_total = df['net'].tail(3).sum() # 近三日總和
         
         status = "中性"
         score = 0
         
-        # 單位是「股」，所以 1,000,000 = 1000張
-        if net_total > 1000000: 
+        # 單位：股 -> 轉張數
+        net_sheets = int(net_total / 1000)
+        
+        if net_sheets > 1000: 
             status = "法人大買"; score = 2
-        elif net_total > 0: 
+        elif net_sheets > 0: 
             status = "法人小買"; score = 1
-        elif net_total < -1000000: 
+        elif net_sheets < -1000: 
             status = "法人大賣"; score = -2
-        elif net_total < 0: 
+        elif net_sheets < 0: 
             status = "法人小賣"; score = -1
             
-        return status, score, int(net_total/1000) # 回傳: 狀態, 分數, 張數(千張)
+        return status, score, net_sheets
     except:
         return "查無資料", 0, 0
 
 def generate_advice(price, ma20, pct, chip_score):
     # 自動生成操作建議
     advice = ""
-    action = "" # 用來分類 Buy/Sell
+    action = ""
     
     # 技術面判斷
     if price >= ma20:
@@ -171,7 +156,6 @@ def generate_advice(price, ma20, pct, chip_score):
                 advice = f"{base} 需觀察是否為洗盤，三日內未站回則轉弱。"
                 action = "SELL_WATCH"
         elif pct > 0:
-            # 月線下反彈
             advice = f"空頭反彈，上方月線({ma20:.2f})有壓，建議逢高減碼。"
             action = "SELL_RALLY"
         else:
@@ -192,9 +176,9 @@ def send_line(msg):
 if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
     
     targets = list(set(WATCHLIST_BASE + user_inv))
-    st.info(f"🐕 正在掃描 {len(targets)} 檔股票... 先篩選有波動者，再查籌碼 (效率最佳化)")
+    st.info(f"🐕 正在掃描 {len(targets)} 檔股票... (1.抓價 -> 2.篩選 -> 3.查籌碼)")
     
-    # 1. 批次抓價 (快)
+    # 1. 批次抓價
     df_bulk = fetch_batch_price(targets)
     
     if df_bulk is not None and not df_bulk.empty:
@@ -225,16 +209,14 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                 is_inv = sid in user_inv
                 
                 # --- 漏斗篩選 ---
-                # 只有 "波動>2%" 或 "波動<-2%" 或 "庫存" 才去查籌碼
-                # 這樣可以省下 80% 的時間，避免 FinMind 卡死
-                if is_inv or abs(pct) > 2.0 or (price < ma20 and pct < -1.5):
+                # 條件：庫存 OR 波動大(>2%) OR 跌破月線(price<ma20)
+                if is_inv or abs(pct) > 2.0 or price < ma20:
                     
-                    # 2. 查籌碼 (慢，但只對重點股查)
+                    # 2. 查籌碼
                     chip_status, chip_score, net_vol = get_chip_analysis(sid)
                     
                     # 3. 生成建議
                     advice, action = generate_advice(price, ma20, pct, chip_score)
-                    
                     name = get_chinese_name(sid)
                     
                     # 分類標籤
@@ -248,16 +230,15 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                         'advice': advice, 'action': action, 'tag': tag_class,
                         'is_inv': is_inv
                     }
-                    
                     results.append(item)
                     
-                    # 收集通知清單
+                    # 通知清單
                     if "BUY_STRONG" in action: buy_list.append(f"🔥 {name} ${price} (+{pct}%)")
                     if "SELL_STRONG" in action: sell_list.append(f"❄️ {name} ${price} ({pct}%)")
                     
             except: pass
             
-            if i % 5 == 0: progress_bar.progress((i+1)/total)
+            if i % 10 == 0: progress_bar.progress((i+1)/total)
             
         progress_bar.empty()
         
@@ -269,11 +250,12 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
         if inv_items:
             for r in inv_items:
                 color = "#FF4444" if r['pct'] > 0 else "#00FF00"
+                chip_color = "tag-buy" if r['chip_vol'] > 0 else "tag-sell"
                 st.markdown(f"""
                 <div class="card {r['tag']}">
                     <div class="stock-header">
                         <span class="stock-title">{r['name']} ({r['sid']})</span>
-                        <span>{r['chip']} ({r['chip_vol']}張)</span>
+                        <span class="tag {chip_color}">{r['chip']} {r['chip_vol']}張</span>
                     </div>
                     <div style="font-size:1.1rem; margin:5px 0;">
                         現價：{r['price']} (<span style='color:{color}'>{r['pct']}%</span>)
@@ -286,7 +268,7 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.warning("庫存無今日數據 (或代號錯誤)")
+            st.warning("庫存代號無資料 (若今日無波動可能未被 Yahoo 更新)")
             
         st.divider()
         
@@ -294,16 +276,16 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
         t1, t2 = st.tabs(["🔥 買進 / 強勢 (多方)", "❄️ 賣出 / 弱勢 (空方)"])
         
         with t1:
-            # 篩選 Action 包含 BUY 或 HOLD_GOOD
             buys = [r for r in results if "BUY" in r['action'] or "HOLD_GOOD" in r['action']]
             buys.sort(key=lambda x: x['pct'], reverse=True)
             if buys:
                 for r in buys:
+                    chip_color = "tag-buy" if r['chip_vol'] > 0 else "tag-sell"
                     st.markdown(f"""
                     <div class="card card-buy">
                         <div class="stock-header">
                             <span class="stock-title">{r['name']} ({r['sid']})</span>
-                            <span class="tag tag-buy">{r['chip']}</span>
+                            <span class="tag {chip_color}">{r['chip']}</span>
                         </div>
                         <div style="margin:5px 0;">現價：{r['price']} (<span style='color:#FF4444'>+{r['pct']}%</span>)</div>
                         <div class="advice-box">{r['advice']}</div>
@@ -312,16 +294,16 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
             else: st.info("今日無強勢買訊。")
             
         with t2:
-            # 篩選 Action 包含 SELL
             sells = [r for r in results if "SELL" in r['action']]
-            sells.sort(key=lambda x: x['pct']) # 跌幅大的在上面
+            sells.sort(key=lambda x: x['pct'])
             if sells:
                 for r in sells:
+                    chip_color = "tag-buy" if r['chip_vol'] > 0 else "tag-sell"
                     st.markdown(f"""
                     <div class="card card-sell">
                         <div class="stock-header">
                             <span class="stock-title">{r['name']} ({r['sid']})</span>
-                            <span class="tag tag-sell">{r['chip']}</span>
+                            <span class="tag {chip_color}">{r['chip']}</span>
                         </div>
                         <div style="margin:5px 0;">現價：{r['price']} (<span style='color:#00FF00'>{r['pct']}%</span>)</div>
                         <div class="advice-box">{r['advice']}</div>
@@ -331,12 +313,12 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
             
         # 發送 LINE
         if buy_list or sell_list:
-            msg = f"\n🐕 總柴戰略報\n"
-            if buy_list: msg += "\n【🔥 籌碼多方】\n" + "\n".join(buy_list[:5]) + "\n"
-            if sell_list: msg += "\n【❄️ 籌碼空方】\n" + "\n".join(sell_list[:5]) + "\n"
+            msg = f"\n🐕 總柴戰略報 ({datetime.datetime.now().strftime('%H:%M')})\n"
+            if buy_list: msg += "\n【🔥 多方訊號】\n" + "\n".join(buy_list[:5]) + "\n"
+            if sell_list: msg += "\n【❄️ 空方訊號】\n" + "\n".join(sell_list[:5]) + "\n"
             send_line(msg)
             
     else:
         st.error("Yahoo Finance 暫時無回應，請稍後再試。")
 else:
-    st.info("🐕 總柴已就位，點擊上方按鈕開始「價量+籌碼」雙刀流掃描！")
+    st.info("🐕 總柴已就位，點擊上方按鈕開始掃描！")
