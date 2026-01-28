@@ -82,7 +82,7 @@ def fetch_batch_price(tickers):
         return None
 
 def get_chip_analysis(sid):
-    # FinMind 查籌碼 (需 tqdm 支援)
+    # FinMind 查籌碼
     try:
         dl = DataLoader()
         start = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
@@ -92,7 +92,6 @@ def get_chip_analysis(sid):
         if df.empty: return "無數據", 0, 0
         
         # 簡單計算買賣超
-        # 注意：FinMind 免費版可能有資料延遲，若盤中無資料會抓到昨天的，這符合盤中參考趨勢
         df['net'] = df['buy'] - df['sell']
         net_total = df['net'].tail(3).sum() # 近三日總和
         
@@ -185,6 +184,7 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
         results = []
         buy_list = []
         sell_list = []
+        inv_notify = []
         
         progress_bar = st.progress(0)
         total = len(targets)
@@ -232,9 +232,23 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                     }
                     results.append(item)
                     
-                    # 通知清單
-                    if "BUY_STRONG" in action: buy_list.append(f"🔥 {name} ${price} (+{pct}%)")
-                    if "SELL_STRONG" in action: sell_list.append(f"❄️ {name} ${price} ({pct}%)")
+                    # --- LINE 訊息組裝 (格式直覺化) ---
+                    # 符號：📈漲 / 📉跌 / 🏦法人
+                    chip_icon = "🏦買" if net_vol > 0 else ("🏦賣" if net_vol < 0 else "🏦平")
+                    line_msg = f"{name}({sid}) ${price} ({pct}%)\n   └ {chip_icon}:{net_vol}張"
+                    
+                    # 庫存通知 (一定要)
+                    if is_inv:
+                        inv_notify.append(f"💼 {line_msg} | {advice}")
+
+                    # 篩選通知 (多/空)
+                    # 多方：站上月線 + 籌碼正向 (或大漲)
+                    if "BUY_STRONG" in action: 
+                        buy_list.append(f"🔥 {line_msg}")
+                    
+                    # 空方：跌破月線 + 籌碼負向 (或重挫)
+                    if "SELL_STRONG" in action or ("SELL" in action and net_vol < -500):
+                        sell_list.append(f"❄️ {line_msg}")
                     
             except: pass
             
@@ -285,7 +299,7 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                     <div class="card card-buy">
                         <div class="stock-header">
                             <span class="stock-title">{r['name']} ({r['sid']})</span>
-                            <span class="tag {chip_color}">{r['chip']}</span>
+                            <span class="tag {chip_color}">{r['chip']} {r['chip_vol']}張</span>
                         </div>
                         <div style="margin:5px 0;">現價：{r['price']} (<span style='color:#FF4444'>+{r['pct']}%</span>)</div>
                         <div class="advice-box">{r['advice']}</div>
@@ -303,7 +317,7 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                     <div class="card card-sell">
                         <div class="stock-header">
                             <span class="stock-title">{r['name']} ({r['sid']})</span>
-                            <span class="tag {chip_color}">{r['chip']}</span>
+                            <span class="tag {chip_color}">{r['chip']} {r['chip_vol']}張</span>
                         </div>
                         <div style="margin:5px 0;">現價：{r['price']} (<span style='color:#00FF00'>{r['pct']}%</span>)</div>
                         <div class="advice-box">{r['advice']}</div>
@@ -311,14 +325,23 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                     """, unsafe_allow_html=True)
             else: st.info("今日無明顯賣訊。")
             
-        # 發送 LINE
-        if buy_list or sell_list:
+        # 發送 LINE (直覺化完整版)
+        if inv_notify or buy_list or sell_list:
             msg = f"\n🐕 總柴戰略報 ({datetime.datetime.now().strftime('%H:%M')})\n"
-            if buy_list: msg += "\n【🔥 多方訊號】\n" + "\n".join(buy_list[:5]) + "\n"
-            if sell_list: msg += "\n【❄️ 空方訊號】\n" + "\n".join(sell_list[:5]) + "\n"
+            
+            if inv_notify:
+                msg += "\n【💼 庫存追蹤】\n" + "\n".join(inv_notify) + "\n"
+            
+            if buy_list:
+                # 這裡不切片了，全部丟進去
+                msg += "\n【🔥 多方攻擊｜法人同步買】\n" + "\n".join(buy_list) + "\n"
+                
+            if sell_list:
+                msg += "\n【❄️ 空方棄守｜法人同步賣】\n" + "\n".join(sell_list) + "\n"
+            
             send_line(msg)
             
     else:
         st.error("Yahoo Finance 暫時無回應，請稍後再試。")
 else:
-    st.info("🐕 總柴已就位，點擊上方按鈕開始掃描！")
+    st.info("🐕 總柴已就位，點擊上方按鈕開始「價量+籌碼」雙刀流掃描！")
