@@ -2,271 +2,218 @@ import streamlit as st
 import pandas as pd
 import twstock
 import time
-import datetime
 import requests
 import urllib3
-from FinMind.data import DataLoader
 
 # --- 1. 系統設定 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-# 修正 SSL
+# 修正 SSL 憑證問題 (這是為了讓你在雲端環境也能連到證交所)
 old_merge = requests.Session.merge_environment_settings
 def new_merge(self, url, proxies, stream, verify, cert):
     if 'twse.com.tw' in url or 'mis.twse.com.tw' in url: verify = False
     return old_merge(self, url, proxies, stream, verify, cert)
 requests.Session.merge_environment_settings = new_merge
 
-st.set_page_config(page_title="總柴快報", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="總柴真實篩選", layout="wide")
 
 st.markdown("""
 <style>
-    .stApp { background-color: #000000; color: #FFFFFF; }
-    .status-box { padding: 10px; border-radius: 5px; background: #222; text-align: center; margin-bottom: 10px; border: 1px solid #444; color: #FFD700; }
-    .chip-buy { color: #FF4444; font-weight: bold; background: #330000; padding: 2px 6px; border-radius: 4px; border: 1px solid #FF4444; }
-    .chip-sell { color: #00FF00; font-weight: bold; background: #003300; padding: 2px 6px; border-radius: 4px; border: 1px solid #00FF00; }
-    thead tr th:first-child {display:none}
-    tbody th {display:none}
+    .stApp { background-color: #0e1117; color: #FFFFFF; }
+    .metric-card { background-color: #262730; padding: 15px; border-radius: 5px; margin-bottom: 10px; border-left: 5px solid #555; }
+    .buy-signal { border-left-color: #FF4B4B !important; } /* 紅色買訊 */
+    .sell-signal { border-left-color: #00FF00 !important; } /* 綠色賣訊 */
+    .hold-signal { border-left-color: #FFA500 !important; } /* 黃色續抱 */
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 內建 150 檔重點監控 (保證有資料) ---
+st.title("🐕 總柴真實篩選器 (麻紗+旺大策略)")
+st.caption("數據來源：證交所 (TWSE) | 篩選邏輯：MA20 月線戰法")
+
+# --- 2. 設定監控清單 ---
+# 為了不跑太久，這裡精選市場最熱門的成交重心股 (可自行增加)
+# 包含：台積電、鴻海、AI股、重電、航運、生技
 WATCHLIST = [
-    '2330','2317','2454','2308','2303','2382','3231','2357','2376','2356','3037','3034','2379','3008',
-    '3045','2412','2345','3017','2324','6669','2395','4938','2408','3443','3661','2301','5871','2881',
-    '2882','2891','2886','2884','2885','2892','2880','2883','2890','5880','2887','2801','2603','2609',
-    '2615','2618','2610','2637','2606','2634','1513','1519','1503','1504','1605','1609','1514','6806',
-    '9958','2031','1101','1216','2002','2105','2201','2207','1301','1303','1326','1402','1476','9910',
-    '1722','1708','4743','1795','4128','6472','6446','6547','3293','3529','6531','8046','8069','6274',
-    '6213','4958','6770','5347','6488','3035','3406','3596','3711','6239','6269','8150','3324','3653',
-    '3665','3694','4919','4961','5269','5274','5483','6104','6121','6147','6187','6223','6244','6271',
-    '6285','6414','6415','6456','6515','6643','6719','6756','8016','8028','8050','8081','8112','8155'
+    '2330', '2317', '2454', '2382', '3231', '2357', '2376', '2356', '3037', '3035', # 權值/AI
+    '1513', '1519', '1503', '1504', '1605', # 重電/電纜
+    '2603', '2609', '2615', '2618', '2610', # 航運
+    '4743', '1795', '3293', '6472', # 生技
+    '2313', '2344', '3006', '3481', '2409', # 熱門電子
+    '8131' # 你的庫存
 ]
 
-# --- 3. 設定 ---
-LINE_TOKEN = None
-if "LINE_TOKEN" in st.secrets:
-    LINE_TOKEN = st.secrets["LINE_TOKEN"]
-else:
-    with st.sidebar:
-        LINE_TOKEN = st.text_input("輸入 LINE Token", type="password")
-
+# 側邊欄設定
 with st.sidebar:
-    st.header("⚙️ 設定")
-    inv_input = st.text_area("庫存代號", "8131")
-    portfolio = [x.strip() for x in inv_input.split(",") if x.strip()]
-    auto_refresh = st.toggle("啟動自動監控", value=True)
+    st.header("設定")
+    inv_input = st.text_input("庫存代號", "8131")
+    user_inv = [x.strip() for x in inv_input.split(",")]
+    # 合併清單並去重
+    target_stocks = list(set(WATCHLIST + user_inv))
 
-# --- 4. 核心功能 ---
-def get_time_status():
-    now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
-    if now.weekday() >= 5: return "🌙 假日休市 (結算數據)"
-    if datetime.time(9,0) <= now.time() <= datetime.time(13,35):
-        return "☀️ 盤中即時 (Live)"
-    return "🌙 盤後結算 (Final)"
+# --- 3. 核心運算函式 ---
 
-# 取得 MA20
-def get_ma20(sid):
+def get_real_data(sid):
+    """抓取即時(或收盤)股價 + 計算 MA20"""
     try:
+        # 1. 抓歷史資料算 MA20
         stock = twstock.Stock(sid)
-        hist = stock.fetch_from(2024, 1)
-        if len(hist) < 20: return None
-        return sum([x.close for x in hist[-20:]]) / 20
-    except: return None
+        # 抓最近 31 天 (確保假日扣除後夠算 20MA)
+        hist = stock.fetch_from(2025, 12) # 這裡年份設稍早確保抓得到，twstock會自動補正
+        if not hist or len(hist) < 5: 
+            # 如果年份設太死可能抓不到，改用 fetch_31
+            hist = stock.fetch_31()
+        
+        if len(hist) < 20:
+            return None # 資料不足無法計算
+            
+        ma20 = sum([x.close for x in hist[-20:]]) / 20
+        
+        # 2. 抓即時/今日收盤資料
+        real = twstock.realtime.get(sid)
+        if not real['success']:
+            return None
+            
+        rt = real['realtime']
+        name = real['info']['name']
+        
+        # 價格容錯 (有些股票沒有成交價，改抓買賣價)
+        try: price = float(rt['latest_trade_price'])
+        except: 
+            try: price = float(rt['best_bid_price'][0])
+            except: price = 0
+            
+        if price == 0: return None # 沒交易
+        
+        # 漲跌幅
+        try: prev = float(rt['previous_close'])
+        except: prev = price
+        pct = round(((price - prev) / prev) * 100, 2)
+        
+        return {
+            "code": sid,
+            "name": name,
+            "price": price,
+            "pct": pct,
+            "ma20": round(ma20, 2),
+            "is_inv": sid in user_inv
+        }
+    except Exception as e:
+        return None
 
-# 取得籌碼
-def get_chips(sid):
-    try:
-        dl = DataLoader()
-        start = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
-        df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
-        if df.empty: return "-", 0
-        recent = df.tail(6)
-        net = recent['buy'].sum() - recent['sell'].sum()
-        if net > 500000: return "法人大買", 2
-        if net > 0: return "法人小買", 1
-        if net < -500000: return "法人大賣", -2
-        if net < 0: return "法人小賣", -1
-        return "-", 0
-    except: return "-", 0
-
-# --- 5. 掃描引擎 (無差別全掃描) ---
-def run_scanner(user_port):
+# --- 4. 執行篩選 ---
+if st.button("🔄 立即掃描真實股價", type="primary"):
+    
     results = []
-    buy_notify = []
-    sell_notify = []
+    progress_text = "正在連線證交所抓取數據..."
+    my_bar = st.progress(0, text=progress_text)
     
-    # 1. 準備清單
-    targets = list(set(user_port + WATCHLIST))
-    total = len(targets)
+    total = len(target_stocks)
     
-    st.toast(f"🐕 啟動無差別掃描！目標 {total} 檔 (請稍候)...")
-    
-    bar = st.progress(0)
-    status_text = st.empty()
-    
-    # 2. 批次抓取 (改成極小批次，避免漏抓)
-    BATCH = 5
-    
-    for i in range(0, total, BATCH):
-        batch_codes = targets[i:i+BATCH]
-        progress = min((i + BATCH) / total, 0.99)
-        bar.progress(progress)
-        status_text.text(f"正在分析第 {i+1}~{min(i+BATCH, total)} 檔...")
+    for i, sid in enumerate(target_stocks):
+        data = get_real_data(sid)
+        if data:
+            # --- 麻紗/旺大 篩選邏輯 ---
+            signal = "觀望"
+            tag = "normal" # 用來標記顏色
+            desc = "盤整中"
+            
+            price = data['price']
+            ma20 = data['ma20']
+            pct = data['pct']
+            
+            # A. 多方邏輯 (站上月線)
+            if price >= ma20:
+                if pct > 3.0: # 旺大: 爆量長紅
+                    signal = "🔥 強力買進"
+                    tag = "buy-signal"
+                    desc = f"強勢噴出！站上月線({ma20})且大漲"
+                elif pct > 0:
+                    signal = "🔴 多頭格局"
+                    tag = "hold-signal"
+                    desc = f"股價在月線({ma20})之上，趨勢向上"
+                else:
+                    signal = "🛡️ 多頭回檔"
+                    tag = "normal"
+                    desc = f"守在月線({ma20})之上"
+            
+            # B. 空方邏輯 (跌破月線)
+            else:
+                if pct < -3.0:
+                    signal = "❄️ 強力賣出"
+                    tag = "sell-signal"
+                    desc = f"危險！跌破月線({ma20})且重挫"
+                else:
+                    signal = "🟢 空頭格局"
+                    tag = "normal"
+                    desc = f"股價被月線({ma20})壓著打"
+
+            data['signal'] = signal
+            data['tag'] = tag
+            data['desc'] = desc
+            results.append(data)
         
-        try:
-            stocks = twstock.realtime.get(batch_codes)
-            if stocks:
-                for sid, data in stocks.items():
-                    if data['success']:
-                        rt = data['realtime']
-                        try: price = float(rt['latest_trade_price'])
-                        except: 
-                            try: price = float(rt['best_bid_price'][0])
-                            except: continue
-                        if price == 0: continue
-                        
-                        try: prev = float(rt['previous_close'])
-                        except: prev = price
-                        
-                        pct = round(((price-prev)/prev)*100, 2)
-                        name = data['info']['name']
-                        is_inv = sid in user_port
-                        
-                        # === 修正重點：全部都要算 MA20，不做任何過濾 ===
-                        # 雖然這樣慢一點，但保證資料完整
-                        
-                        ma20 = get_ma20(sid)
-                        if not ma20: ma20 = prev # 防呆
-                        
-                        # 只有當波動大或庫存時，才去查籌碼 (節省時間)
-                        chip_msg = "-"
-                        chip_score = 0
-                        if is_inv or abs(pct) > 2.0:
-                            chip_msg, chip_score = get_chips(sid)
-                        
-                        signal = "➖ 觀望"
-                        reason = "-"
-                        code_val = 0
-                        
-                        # A. 買方邏輯
-                        if pct > 0:
-                            if price >= ma20: # 站上月線
-                                if pct > 3.0:
-                                    signal = "🔥 推薦買進"
-                                    reason = f"站穩月線({ma20:.1f})+爆量"
-                                    code_val = 10
-                                    if chip_score < 0: signal = "⚠️ 小心誘多"
-                                    else: buy_notify.append(f"🔥 {name} ${price} (+{pct}%)")
-                                else:
-                                    signal = "🔴 多頭排列"
-                                    reason = "站穩月線"
-                                    code_val = 5
-                                    if is_inv: buy_notify.append(f"🔴 {name} ${price} (+{pct}%)")
-                            else:
-                                signal = "🌤️ 反彈"
-                                reason = "月線下"
-                                code_val = 1
-                        
-                        # B. 賣方邏輯
-                        elif pct < 0:
-                            if price < ma20: # 破月線
-                                if pct < -3.0:
-                                    signal = "❄️ 推薦賣出"
-                                    reason = f"跌破月線({ma20:.1f})+重挫"
-                                    code_val = -10
-                                    sell_notify.append(f"❄️ {name} ${price} ({pct}%)")
-                                else:
-                                    signal = "🟢 轉弱"
-                                    reason = "跌破月線"
-                                    code_val = -5
-                                    if is_inv: sell_notify.append(f"🟢 {name} ${price} ({pct}%)")
-                            else:
-                                signal = "📉 回檔"
-                                reason = "月線上"
-                                code_val = -1
-                        
-                        # 只要有抓到，全部列入！不准過濾！
-                        results.append({
-                            "代號": sid, "名稱": name, "現價": price, "漲幅": pct,
-                            "訊號": signal, "理由": reason, "籌碼": chip_msg,
-                            "MA20": round(ma20, 2), "code": code_val, "is_inv": is_inv
-                        })
-            
-            time.sleep(0.1) # 休息一下
-            
-        except: pass
-
-    bar.empty()
-    status_text.empty()
-    return pd.DataFrame(results), buy_notify, sell_notify
-
-def send_line_notify(buys, sells):
-    if not LINE_TOKEN: return
-    msg = f"\n🐕 總柴快報 ({get_time_status()})\n"
-    has_msg = False
-    
-    if buys:
-        msg += "\n【🔥 強勢訊號】\n" + "\n".join(buys[:5]) + "\n"
-        has_msg = True
-    if sells:
-        msg += "\n【❄️ 弱勢訊號】\n" + "\n".join(sells[:5]) + "\n"
-        has_msg = True
+        # 更新進度條
+        my_bar.progress((i + 1) / total)
+        time.sleep(0.05) # 稍微緩衝避免被證交所封鎖
         
-    if has_msg:
-        url = "https://api.line.me/v2/bot/message/broadcast"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"}
-        requests.post(url, headers=headers, data=json.dumps({"messages": [{"type": "text", "text": msg}]}))
-        st.toast("LINE 通知已發送")
-
-# --- 6. 主介面 ---
-status_now = get_time_status()
-st.title("🐕 總柴快報")
-st.markdown(f"<div class='status-box'>{status_now}</div>", unsafe_allow_html=True)
-
-if 'data' not in st.session_state: st.session_state.data = pd.DataFrame()
-
-run = False
-if st.session_state.data.empty: run = True
-if st.button("🔄 立即刷新 (全無過濾)"): run = True
-
-if run:
-    df, buys, sells = run_scanner(portfolio)
-    st.session_state.data = df
-    if buys or sells: send_line_notify(buys, sells)
-
-# 顯示表格
-df_show = st.session_state.data
-if not df_show.empty:
+    my_bar.empty()
     
-    if portfolio:
-        st.subheader("💼 我的庫存")
-        inv_df = df_show[df_show['is_inv'] == True]
-        if not inv_df.empty:
-            for r in inv_df.to_dict('records'):
-                color = "#FF4444" if r['漲幅'] > 0 else "#00FF00"
-                st.markdown(f"**{r['名稱']} ({r['代號']})**: {r['訊號']} <span style='color:#ccc'>({r['理由']})</span><br>${r['現價']} (<span style='color:{color}'>{r['漲幅']}%</span>) | MA20: {r['MA20']}", unsafe_allow_html=True)
-        else: st.info("庫存無資料")
-            
+    # --- 5. 顯示結果 ---
+    
+    # 庫存專區
+    st.subheader(f"💼 我的庫存 ({len(user_inv)}檔)")
+    inv_data = [r for r in results if r['is_inv']]
+    if inv_data:
+        for r in inv_data:
+            color = "red" if r['pct'] > 0 else "green"
+            st.markdown(f"""
+            <div class="metric-card {r['tag']}">
+                <h4>{r['name']} ({r['code']}) - {r['signal']}</h4>
+                <p>現價：<b>{r['price']}</b> (<span style='color:{color}'>{r['pct']}%</span>)</p>
+                <p>MA20月線：{r['ma20']} | 狀態：{r['desc']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("庫存抓取失敗或無資料")
+
     st.divider()
+
+    # 篩選結果
+    tab1, tab2 = st.tabs(["🔥 推薦買進 / 觀察", "❄️ 推薦賣出 / 避開"])
     
-    t1, t2, t3 = st.tabs(["🔥 推薦買進", "❄️ 推薦賣出", "📋 全部清單 (150檔)"])
-    cols = ['代號', '名稱', '現價', '漲幅', '訊號', '籌碼', '理由']
-    
-    with t1:
-        d1 = df_show[df_show['code'] >= 5].sort_values('漲幅', ascending=False)
-        st.dataframe(d1, column_order=cols, use_container_width=True, hide_index=True)
+    with tab1:
+        # 篩選條件：Tag是 buy 或 hold 且 漲幅>0
+        buys = [r for r in results if r['price'] >= r['ma20'] and r['pct'] > 2.0]
+        # 排序：漲幅由大到小
+        buys.sort(key=lambda x: x['pct'], reverse=True)
         
-    with t2:
-        d2 = df_show[df_show['code'] <= -5].sort_values('漲幅', ascending=True)
-        st.dataframe(d2, column_order=cols, use_container_width=True, hide_index=True)
+        if buys:
+            for r in buys:
+                st.markdown(f"""
+                <div class="metric-card buy-signal">
+                    <b>{r['name']} ({r['code']})</b> <span style='float:right; color:red'>+{r['pct']}%</span><br>
+                    現價: {r['price']} | MA20: {r['ma20']}<br>
+                    <span style='color:#ccc'>{r['desc']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("今日盤勢較弱，無符合「站上月線+漲幅>2%」的股票。")
+
+    with tab2:
+        # 篩選條件：跌破月線 且 跌幅 < -2%
+        sells = [r for r in results if r['price'] < r['ma20'] and r['pct'] < -2.0]
+        sells.sort(key=lambda x: x['pct'])
         
-    with t3:
-        # 這裡就是你要的：所有 150 檔全部列出來，沒過濾！
-        st.dataframe(df_show, column_order=cols, use_container_width=True, hide_index=True)
+        if sells:
+            for r in sells:
+                st.markdown(f"""
+                <div class="metric-card sell-signal">
+                    <b>{r['name']} ({r['code']})</b> <span style='float:right; color:#00FF00'>{r['pct']}%</span><br>
+                    現價: {r['price']} | MA20: {r['ma20']}<br>
+                    <span style='color:#ccc'>{r['desc']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("今日無符合「跌破月線+跌幅<-2%」的重挫股。")
 
 else:
-    st.info("🐕 準備掃描中...")
-
-if auto_refresh and "盤中" in status_now:
-    time.sleep(300)
-    st.rerun()
+    st.info("👋 請點擊上方按鈕，總柴會立刻連線證交所幫你算 MA20！")
