@@ -1,7 +1,7 @@
 streamlit
 pandas
-plotly
-finmind
-requests
 twstock
 lxml
+finmind
+requests
+tqdm
