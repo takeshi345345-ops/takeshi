@@ -21,7 +21,7 @@ requests.Session.merge_environment_settings = merge_environment_settings
 
 # --- 2. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴快報 (籌碼嚴選版)",
+    page_title="總柴快報 (多空平衡版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -37,7 +37,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐕 總柴台股快報：技術+籌碼嚴選")
+st.title("🐕 總柴台股快報：多空無死角監控")
 
 # --- 3. 設定 ---
 LINE_TOKEN = None
@@ -64,8 +64,8 @@ if 'run_date' not in st.session_state or st.session_state.run_date != current_da
     st.session_state.done_1230 = False
 
 SECTOR_DB = {
-    "🔥 半導體": {'2330':'台積電','2454':'聯發科','2303':'聯電','3711':'日月光','3034':'聯詠','2379':'瑞昱','3443':'創意','3661':'世芯-KY','3035':'智原','3529':'力旺','6531':'愛普','3189':'景碩','8046':'南電','3037':'欣興','8299':'群聯','3260':'威剛','2408':'南亞科','4966':'譜瑞','6104':'創惟','6415':'矽力','6756':'威鋒','2344':'華邦電','2337':'旺宏','6271':'同欣電','5269':'祥碩','8016':'矽創','8131':'福懋科','8131':'福懋科'},
-    "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢','3483':'力致'},
+    "🔥 半導體": {'2330':'台積電','2454':'聯發科','2303':'聯電','3711':'日月光','3034':'聯詠','2379':'瑞昱','3443':'創意','3661':'世芯-KY','3035':'智原','3529':'力旺','6531':'愛普','3189':'景碩','8046':'南電','3037':'欣興','8299':'群聯','3260':'威剛','2408':'南亞科','4966':'譜瑞','6104':'創惟','6415':'矽力','6756':'威鋒','2344':'華邦電','2337':'旺宏','6271':'同欣電','5269':'祥碩','8016':'矽創','8131':'福懋科'},
+    "🤖 AI與電腦": {'2382':'廣達','3231':'緯創','2356':'英業達','6669':'緯穎','2376':'技嘉','2357':'華碩','2324':'仁寶','2301':'光寶科','3017':'奇鋐','3324':'雙鴻','2421':'建準','3653':'健策','3483':'力致','8996':'高力','2368':'金像電','6274':'台燿','6213':'聯茂','2395':'研華','6414':'樺漢'},
     "📡 網通光電": {'2345':'智邦','5388':'中磊','3596':'智易','6285':'啟碁','4906':'正文','3704':'合勤控','3062':'建漢','2409':'友達','3481':'群創','6116':'彩晶','3008':'大立光','3406':'玉晶光','4961':'天鈺'},
     "⚡ 重電綠能": {'1513':'中興電','1519':'華城','1503':'士電','1514':'亞力','1609':'大亞','1605':'華新','1618':'合機','1603':'華電','6806':'森崴能源','3708':'上緯投控','9958':'世紀鋼','2031':'新光鋼','1504':'東元','1605':'華新'},
     "🏗️ 營建資產": {'2501':'國建','2542':'興富發','2548':'華固','5522':'遠雄','2520':'冠德','2515':'中工','2538':'基泰','2505':'國揚','2547':'日勝生','5534':'長虹','2545':'皇翔','2537':'聯上發','9940':'信義'},
@@ -100,37 +100,23 @@ def send_line(msg):
     except Exception as e:
         return False, str(e)
 
-# --- 5. 深度分析函式 (技術+籌碼) ---
+# --- 5. 深度分析 ---
 def analyze_deep(sid):
-    # 這個函式只對「潛在飆股」執行，避免全市場掃描太慢
     try:
-        # 1. 抓歷史股價 (算 MA20)
         stock = twstock.Stock(sid)
         stock.fetch_from(2024, 1)
-        if len(stock.price) < 20: return None, "資料不足"
+        if len(stock.price) < 20: return None, "中性"
         ma20 = sum(stock.price[-20:]) / 20
         
-        # 2. 抓法人籌碼 (FinMind 抓近3日)
-        dl = DataLoader()
-        # 抓最近 10 天確保有資料
-        start_d = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
-        df_chips = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start_d)
-        
-        chips_status = "中性"
-        if not df_chips.empty:
-            # 取最近 3 天的資料
-            recent = df_chips.tail(6) # 3天 * 2種法人(外資/投信) approx
-            # 簡單加總 外資 + 投信 的買賣超
-            total_buy = recent['buy'].sum()
-            total_sell = recent['sell'].sum()
-            net = total_buy - total_sell
+        # 簡單籌碼 (模擬，因 FinMind 盤中不穩)
+        # 用成交量來推估熱度
+        avg_vol = sum(stock.capacity[-5:]) / 5
+        curr_vol = stock.capacity[-1]
+        chips = "量增" if curr_vol > avg_vol * 1.5 else "量縮"
             
-            if net > 0: chips_status = "法人買超"
-            elif net < 0: chips_status = "法人賣超"
-            
-        return ma20, chips_status
+        return ma20, chips
     except:
-        return None, "查無籌碼"
+        return None, "中性"
 
 # --- 6. 核心掃描 ---
 def get_targets(user_port, sectors):
@@ -146,7 +132,7 @@ def get_targets(user_port, sectors):
 def scan_stocks(target_codes, code_info):
     results, buy_sigs, sell_sigs = [], [], []
     
-    st.toast("🐕 第一階段：全市場即時掃描...")
+    st.toast("🐕 市場全掃描中...")
     BATCH = 20
     
     for i in range(0, len(target_codes), BATCH):
@@ -170,68 +156,65 @@ def scan_stocks(target_codes, code_info):
                         is_inv = code_info[sid]['is_inv']
                         sec = code_info[sid]['sector']
                         
-                        # === 第二階段：深度分析 (只針對有波動或庫存) ===
-                        ma20 = prev # 預設昨收
-                        ma20_source = "昨收"
-                        chips = "未查詢"
+                        ma20 = prev
+                        ma_source = "昨收"
+                        chips = "-"
                         
-                        # 只有：庫存、漲>2%、跌<-2% 才去查 MA20 和 籌碼
-                        # 這樣可以避開那些盤整的股票，把資源集中在飆股
-                        is_active = is_inv or pct > 2.0 or pct < -2.0
-                        
-                        if is_active:
+                        # 庫存或波動大，查細節
+                        if is_inv or abs(pct) > 2.0:
                             real_ma20, real_chips = analyze_deep(sid)
                             if real_ma20:
                                 ma20 = real_ma20
-                                ma20_source = "MA20"
+                                ma_source = "MA20"
                                 chips = real_chips
                         
                         signal = "➖ 盤整"
-                        reason = "量縮觀望"
+                        reason = "波動不大"
                         code_val = 0 
                         
-                        # === 你的嚴格篩選邏輯 ===
+                        # === 修正後的寬鬆邏輯 ===
                         
-                        # A. 推薦買進 (站上月線 + 爆量長紅 + 法人買/中性)
-                        if price >= ma20 and pct > 3.0:
-                            signal = "🔥 推薦買進"
-                            reason = f"🚀 站上月線+爆量長紅 ({chips})"
-                            code_val = 10
-                            # 只有籌碼是正向或中性才推，法人大賣就不推
-                            if "賣" not in chips:
-                                buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
-                        
-                        # B. 庫存多頭 (站上月線)
-                        elif is_inv and price >= ma20:
-                             signal = "🔴 持股續抱"
-                             reason = f"🛡️ 守穩月線 ({chips})"
-                             code_val = 5
+                        # 1. 買方 (紅)
+                        if pct > 0:
+                            if pct > 3.0:
+                                signal = "🔥 暴力噴出"
+                                reason = f"🚀 漲幅擴大+站上{ma_source}"
+                                code_val = 10
+                                buy_sigs.append({'msg': f"🔥 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
+                            elif price > ma20:
+                                signal = "🔴 多頭排列"
+                                reason = f"🛡️ 站穩{ma_source}"
+                                code_val = 5
+                                if is_inv or pct > 2.0:
+                                    buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
+                            else:
+                                signal = "🌤️ 反彈"
+                                reason = f"⚠️ {ma_source}下反彈"
+                                code_val = 2
 
-                        # C. 推薦賣出 (跌破月線 + 長黑 + 法人賣/中性)
-                        elif price < ma20 and pct < -3.0:
-                            signal = "❄️ 推薦賣出"
-                            reason = f"📉 跌破月線+重挫 ({chips})"
-                            code_val = -10
-                            if "買" not in chips:
-                                sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
-
-                        # D. 庫存轉弱
-                        elif is_inv and price < ma20:
-                            signal = "🟢 庫存轉弱"
-                            reason = f"❌ 跌破月線 ({chips})"
-                            code_val = -5
-                            sell_sigs.append({'msg': f"📉 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
-                        
-                        # E. 其他 (單純顯示漲跌，不給訊號)
-                        else:
-                            if pct > 0: 
-                                signal = "📈 上漲"
-                                code_val = 1
-                            elif pct < 0:
-                                signal = "📉 下跌"
-                                code_val = -1
-                            if is_active:
-                                reason = f"{ma20_source}盤整 ({chips})"
+                        # 2. 賣方 (綠)
+                        elif pct < 0:
+                            # 🔥 修正：不管有沒有破月線，只要跌深就警示
+                            if pct < -2.0:
+                                signal = "🟢 轉弱下跌"
+                                reason = "📉 短線急殺"
+                                code_val = -5
+                                # 只要是庫存，跌了就通知；非庫存要跌多才通知
+                                if is_inv or pct < -3.0:
+                                    sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
+                            
+                            # 如果還跌破月線，加重語氣
+                            if price < ma20:
+                                if pct < -3.0:
+                                    signal = "❄️ 破線重挫"
+                                    reason = f"❌ 跌破{ma_source}+長黑"
+                                    code_val = -10
+                                    # 這是最嚴重的，一定要通知
+                                    sell_sigs.append({'msg': f"❄️ {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
+                                else:
+                                    signal = "📉 空頭排列"
+                                    reason = f"❌ 位於{ma_source}之下"
+                                    code_val = -5
 
                         results.append({
                             '代號': sid, '名稱': name, '現價': price, '漲幅': pct, 
@@ -278,29 +261,28 @@ if run_now:
     elif trigger_source == "915": st.session_state.done_915 = True
     elif trigger_source == "1230": st.session_state.done_1230 = True
 
-    # LINE 發送 (嚴格版)
     if LINE_TOKEN and trigger_source != "init":
         msg_body = ""
         should_send = False
         
         my_msgs = [x['msg'] for x in buys if x['is_inv']] + [x['msg'] for x in sells if x['is_inv']]
         if my_msgs: 
-            msg_body += "\n【💼 庫存 (福懋科)】\n" + "\n".join(my_msgs) + "\n"
+            msg_body += "\n【💼 庫存警示】\n" + "\n".join(my_msgs) + "\n"
             should_send = True
 
-        hot_buys = [x['msg'] for x in buys if not x['is_inv']]
+        hot_buys = [x['msg'] for x in buys if not x['is_inv'] and "🔥" in x['msg']]
         if hot_buys: 
-            msg_body += "\n【🔥 推薦買進】\n" + "\n".join(hot_buys[:5]) + "\n"
+            msg_body += "\n【🔥 暴力噴出】\n" + "\n".join(hot_buys[:5]) + "\n"
             should_send = True
             
-        hot_sells = [x['msg'] for x in sells if not x['is_inv']]
+        hot_sells = [x['msg'] for x in sells if not x['is_inv']] # 只要是推薦賣出的都列出來
         if hot_sells: 
-            msg_body += "\n【❄️ 推薦賣出】\n" + "\n".join(hot_sells[:5]) + "\n"
+            msg_body += "\n【❄️ 弱勢焦點】\n" + "\n".join(hot_sells[:5]) + "\n"
             should_send = True
 
         if should_send or trigger_source == "manual":
             title = f"🐕 總柴快報 ({trigger_source})"
-            if not should_send: msg_body = "\n(無符合條件之標的)"
+            if not should_send: msg_body = "\n(市場平靜，無特殊訊號)"
             send_line(title + "\n" + msg_body)
             st.toast("✅ LINE 通知已發送")
 
@@ -315,24 +297,26 @@ if not df_show.empty:
         if not my_df.empty:
             for row in my_df.itertuples():
                 color = "#FF4444" if row.漲幅 > 0 else "#00FF00"
-                st.markdown(f"**{row.名稱} ({row.代號})**: {row.訊號} <span style='color:#888'>({row.理由})</span><br>${row.現價} (<span style='color:{color}'>{row.漲幅}%</span>) | 籌碼:{row.籌碼}", unsafe_allow_html=True)
+                st.markdown(f"**{row.名稱} ({row.代號})**: {row.訊號} <span style='color:#888'>({row.理由})</span><br>${row.現價} (<span style='color:{color}'>{row.漲幅}%</span>)", unsafe_allow_html=True)
         else: st.info("庫存無資料")
 
     st.divider()
     
     t1, t2, t3 = st.tabs(["📈 多方排行", "📉 空方排行", "全部列表"])
-    cols = ['名稱', '現價', '漲幅', '訊號', '籌碼', '理由']
+    cols = ['名稱', '現價', '漲幅', '訊號', '理由']
     
     with t1:
+        # 只要 >= 0 就列出來
         d1 = df_show[df_show['漲幅'] >= 0].sort_values('漲幅', ascending=False)
         st.dataframe(d1, column_order=cols, use_container_width=True, hide_index=True)
     with t2:
+        # 只要 < 0 就列出來
         d2 = df_show[df_show['漲幅'] < 0].sort_values('漲幅', ascending=True)
         st.dataframe(d2, column_order=cols, use_container_width=True, hide_index=True)
     with t3:
         st.dataframe(df_show.sort_values('漲幅', ascending=False), column_order=cols, use_container_width=True, hide_index=True)
 else:
-    st.info("🐕 總柴暖身中...")
+    st.info("🐕 總柴正在努力連線中... (開機自動載入)")
 
 if auto_refresh:
     time.sleep(300)
