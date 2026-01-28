@@ -7,7 +7,7 @@ import requests
 import urllib3
 import json
 
-# --- 1. SSL 憑證修正 (維持連線) ---
+# --- 1. SSL 憑證修正 (維持連線穩定) ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 old_merge_environment_settings = requests.Session.merge_environment_settings
 
@@ -18,9 +18,9 @@ def merge_environment_settings(self, url, proxies, stream, verify, cert):
 
 requests.Session.merge_environment_settings = merge_environment_settings
 
-# --- 2. 介面定版 (不會再亂改) ---
+# --- 2. 頁面設定 ---
 st.set_page_config(
-    page_title="總柴快報 (自動載入版)",
+    page_title="總柴快報 (雙策略版)",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -29,7 +29,7 @@ st.markdown("""
 <style>
     .stApp { background-color: #000000; color: #FFFFFF; }
     h1, h2, h3 { color: #00E5FF !important; }
-    /* 卡片樣式固定 */
+    /* 卡片樣式 */
     .stock-card { padding: 12px; margin-bottom: 8px; border-radius: 6px; border-left: 6px solid #555; background: #1a1a1a; }
     .status-bar { background: #222; padding: 8px; border-radius: 5px; text-align: center; color: #aaa; font-size: 0.8rem; margin-bottom: 15px;}
     /* 隱藏表格索引 */
@@ -38,7 +38,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐕 總柴台股快報")
+st.title("🐕 總柴台股快報：麻紗 x 旺大 雙策略")
 
 # --- 3. 設定區 ---
 LINE_TOKEN = None
@@ -52,13 +52,13 @@ else:
 def get_taiwan_time():
     return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
 
-# --- 5. 狀態與資料庫 ---
+# --- 5. 狀態初始化 ---
 if 'last_scan_data' not in st.session_state:
-    st.session_state.last_scan_data = pd.DataFrame() # 存資料，避免重整消失
+    st.session_state.last_scan_data = pd.DataFrame()
 if 'last_update_time' not in st.session_state:
     st.session_state.last_update_time = "尚未更新"
 
-# 狀態標記 (確保每天只發 3 次)
+# 狀態標記
 current_date = get_taiwan_time().date()
 if 'run_date' not in st.session_state or st.session_state.run_date != current_date:
     st.session_state.run_date = current_date
@@ -82,11 +82,11 @@ SECTOR_DB = {
 
 with st.sidebar:
     st.header("⚙️ 設定")
-    # 預設開啟自動監控
     auto_refresh = st.toggle("啟動自動監控 (每5分)", value=True)
     st.divider()
     st.subheader("庫存")
-    inv = st.text_area("代號", "2330, 2603")
+    # 🔥 更新：你的福懋科
+    inv = st.text_area("代號", "8131")
     portfolio = [x.strip() for x in inv.split(",") if x.strip()]
     
     st.divider()
@@ -104,9 +104,8 @@ def send_line(msg):
     except Exception as e:
         return False, str(e)
 
-# --- 6. 核心掃描 (含策略擴充) ---
+# --- 6. 核心掃描 (麻紗 x 旺大) ---
 def calculate_ma20(sid):
-    # 用來判斷支撐，但不是唯一條件
     try:
         stock = twstock.Stock(sid)
         stock.fetch_from(2024, 1)
@@ -127,8 +126,7 @@ def get_targets(user_port, sectors):
 def scan_stocks(target_codes, code_info):
     results, buy_sigs, sell_sigs = [], [], []
     
-    # 不再用進度條佔版面，用 toast 提示
-    st.toast("🐕 正在掃描市場資料...")
+    st.toast("🐕 雙策略掃描中...")
     BATCH = 20
     
     for i in range(0, len(target_codes), BATCH):
@@ -152,52 +150,79 @@ def scan_stocks(target_codes, code_info):
                         is_inv = code_info[sid]['is_inv']
                         sec = code_info[sid]['sector']
                         
-                        # --- 策略擴充：不只看 MA20，也看動能 ---
-                        ma20 = prev 
+                        # --- 雙策略核心邏輯 ---
+                        # 1. 麻紗：MA20 (月線)
+                        # 2. 旺大：動能噴出 (趨勢強)
+                        
+                        ma20 = prev
                         has_ma = False
-                        # 庫存或大漲大跌才算 MA
-                        if is_inv or abs(pct) > 2.0:
+                        ma_source = "昨收(概估)"
+                        
+                        # 庫存或波動大時，精算 MA20
+                        if is_inv or abs(pct) > 1.0:
                             real_ma20 = calculate_ma20(sid)
                             if real_ma20:
                                 ma20 = real_ma20
                                 has_ma = True
+                                ma_source = "MA20"
                         
-                        signal = "🛡️ 觀望"
-                        reason = "盤整"
+                        signal = "➖ 盤整"
+                        reason = "波動不大"
+                        code_val = 0 
                         
-                        # --- 策略 A: 暴力噴出 (不管 MA) ---
-                        # 像華新這種，只要動能夠強，直接抓
-                        if pct > 4.0:
-                            signal = "🚀 暴力噴出"
-                            reason = "🔥 強勢漲幅擴大"
-                            buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
-                        
-                        # --- 策略 B: 站上 MA20 (標準麻紗) ---
-                        elif has_ma and price >= ma20 and pct > 1.0:
-                            signal = "🔴 趨勢偏多"
-                            reason = "🛡️ 站上月線"
-                            if is_inv: buy_sigs.append({'msg': f"📈 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
-                        
-                        # --- 策略 C: 跌深反彈 (搶反彈) ---
-                        # 股價在月下，但突然大漲，可能是V轉
-                        elif has_ma and price < ma20 and pct > 3.0:
-                            signal = "🌤️ 跌深反彈"
-                            reason = "⚠️ 破線後急拉"
-                            buy_sigs.append({'msg': f"🌤️ {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
+                        # === 判定邏輯 (優先順序：旺大飆股 > 麻紗多頭 > 麻紗空頭) ===
 
-                        # --- 空方訊號 ---
-                        elif pct < -3.5:
-                            signal = "❄️ 重挫殺盤"
-                            reason = "📉 跌幅擴大"
-                            sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
-                        elif has_ma and price < ma20 and pct < -0.5:
-                            signal = "🟢 弱勢破線"
-                            reason = "❌ 月線之下"
-                            if is_inv: sell_sigs.append({'msg': f"📉 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
+                        # A. 旺大流：強勢噴出 (漲幅>3.5% 且 在月線之上)
+                        if pct > 3.5 and price >= ma20:
+                            signal = "🔥 旺大飆股"
+                            reason = f"🚀 強勢噴出 (>{ma_source})"
+                            code_val = 10
+                            buy_sigs.append({'msg': f"🔥 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
+
+                        # B. 麻紗流：多頭排列 (漲幅>0 且 在月線之上)
+                        elif price >= ma20 and pct > 0:
+                            signal = "🔴 麻紗多頭"
+                            reason = f"🛡️ 站穩{ma_source}之上"
+                            code_val = 5
+                            if is_inv:
+                                buy_sigs.append({'msg': f"🔴 {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
+                        
+                        # C. 跌深反彈 (在月線之下，但漲幅>2%)
+                        elif price < ma20 and pct > 2.0:
+                             signal = "🌤️ 跌深反彈"
+                             reason = f"⚠️ {ma_source}之下反彈"
+                             code_val = 2
+                             if is_inv:
+                                buy_sigs.append({'msg': f"🌤️ {name} ${price} (+{pct}%) | {reason}", 'is_inv': is_inv})
+
+                        # D. 麻紗流：空頭破線 (跌幅<-2% 或 跌破月線)
+                        elif price < ma20:
+                            if pct < -2.5:
+                                signal = "❄️ 旺大殺盤" # 跌太兇
+                                reason = f"📉 重挫跌破{ma_source}"
+                                code_val = -10
+                                sell_sigs.append({'msg': f"🟢 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
+                            else:
+                                signal = "🟢 麻紗轉弱"
+                                reason = f"❌ 位於{ma_source}之下"
+                                code_val = -5
+                                if is_inv:
+                                    sell_sigs.append({'msg': f"📉 {name} ${price} ({pct}%) | {reason}", 'is_inv': is_inv})
+
+                        # E. 盤整 (其他狀況)
+                        else:
+                            # 即使是盤整，根據漲跌給顏色
+                            if pct > 0: 
+                                signal = "🛡️ 盤整偏多"
+                                code_val = 1
+                            elif pct < 0:
+                                signal = "🛡️ 盤整偏空"
+                                code_val = -1
 
                         results.append({
                             '代號': sid, '名稱': name, '現價': price, '漲幅': pct, 
-                            '訊號': signal, '理由': reason, '族群': sec, 'is_inv': is_inv
+                            '訊號': signal, '理由': reason, '族群': sec, 'is_inv': is_inv,
+                            'MA20': round(ma20, 2)
                         })
             time.sleep(0.5)
         except: pass
@@ -205,31 +230,28 @@ def scan_stocks(target_codes, code_info):
     if not results: return pd.DataFrame(), [], []
     return pd.DataFrame(results), buy_sigs, sell_sigs
 
-# --- 7. 主流程 (自動執行) ---
+# --- 7. 主流程 ---
 targets, info = get_targets(portfolio, selected_sectors)
 
-# 🔥 關鍵修改：不依賴按鈕，直接檢查 session 狀態
-# 如果剛打開網頁 (data 為空)，直接執行一次
+# 判斷是否執行 (開機自動執行)
 run_now = False
 trigger_source = "auto"
 
 if st.session_state.last_scan_data.empty:
     run_now = True
-    trigger_source = "init" # 初始載入
+    trigger_source = "init" # 初始
 
-# 手動刷新按鈕
 if st.button("🔄 立即刷新", type="primary"):
     run_now = True
     trigger_source = "manual"
 
-# 時間排程檢查
+# 時間排程
 now_tw = get_taiwan_time()
 current_time_str = now_tw.strftime("%H:%M")
 curr_h = now_tw.hour
 curr_m = now_tw.minute
 
 if not run_now:
-    # 08:30, 09:15, 12:30 (寬容度 15分)
     if curr_h == 8 and 30 <= curr_m <= 45 and not st.session_state.done_830:
         run_now = True; trigger_source = "830"
     elif curr_h == 9 and 15 <= curr_m <= 30 and not st.session_state.done_915:
@@ -237,53 +259,51 @@ if not run_now:
     elif curr_h == 12 and 30 <= curr_m <= 45 and not st.session_state.done_1230:
         run_now = True; trigger_source = "1230"
 
-# --- 執行區 ---
+# 執行
 if run_now:
     df, buys, sells = scan_stocks(targets, info)
     
-    # 存入 session，這樣自動刷新時畫面才不會白掉
     st.session_state.last_scan_data = df
     st.session_state.last_update_time = current_time_str
     
-    # 標記時間點已執行
     if trigger_source == "830": st.session_state.done_830 = True
     elif trigger_source == "915": st.session_state.done_915 = True
     elif trigger_source == "1230": st.session_state.done_1230 = True
 
-    # --- LINE 發送邏輯 (嚴格限制) ---
-    if LINE_TOKEN and trigger_source != "init": # 剛打開網頁不發LINE，避免太吵
+    # LINE 發送 (寧缺勿濫)
+    if LINE_TOKEN and trigger_source != "init":
         msg_body = ""
         should_send = False
         
-        # 1. 庫存有事一定發
+        # 1. 庫存 (有訊號必發)
         my_msgs = [x['msg'] for x in buys if x['is_inv']] + [x['msg'] for x in sells if x['is_inv']]
         if my_msgs: 
-            msg_body += "\n【💼 庫存警示】\n" + "\n".join(my_msgs) + "\n"
+            msg_body += "\n【💼 庫存 (福懋科)】\n" + "\n".join(my_msgs) + "\n"
             should_send = True
 
-        # 2. 市場有飆股才發
-        hot_buys = [x['msg'] for x in buys if not x['is_inv'] and "🚀" in x['msg']]
-        hot_sells = [x['msg'] for x in sells if not x['is_inv'] and "❄️" in x['msg']]
-        
+        # 2. 旺大飆股 (漲>3.5%必發)
+        hot_buys = [x['msg'] for x in buys if not x['is_inv'] and "🔥" in x['msg']]
         if hot_buys: 
-            msg_body += "\n【🔥 暴力噴出】\n" + "\n".join(hot_buys[:5]) + "\n"
+            msg_body += "\n【🔥 旺大飆股】\n" + "\n".join(hot_buys[:5]) + "\n"
             should_send = True
+            
+        # 3. 旺大殺盤 (跌>3.5%必發)
+        hot_sells = [x['msg'] for x in sells if not x['is_inv'] and "❄️" in x['msg']]
         if hot_sells: 
             msg_body += "\n【❄️ 重挫殺盤】\n" + "\n".join(hot_sells[:5]) + "\n"
             should_send = True
-            
+
         if should_send or trigger_source == "manual":
             title = f"🐕 總柴快報 ({trigger_source})"
             if not should_send: msg_body = "\n(市場平靜，無特殊訊號)"
             send_line(title + "\n" + msg_body)
             st.toast("✅ LINE 通知已發送")
 
-# --- 8. 顯示層 (讀取 Session) ---
-st.markdown(f"<div class='status-bar'>🕒 最後更新: {st.session_state.last_update_time} | 下次自動掃描: 5分鐘後</div>", unsafe_allow_html=True)
+# --- 8. 顯示 (全揭露) ---
+st.markdown(f"<div class='status-bar'>🕒 最後更新: {st.session_state.last_update_time} | 自動監控中</div>", unsafe_allow_html=True)
 
 df_show = st.session_state.last_scan_data
 if not df_show.empty:
-    # 庫存
     if portfolio:
         st.markdown("### 💼 我的庫存")
         my_df = df_show[df_show['is_inv'] == True]
@@ -291,26 +311,29 @@ if not df_show.empty:
             for row in my_df.itertuples():
                 color = "#FF4444" if row.漲幅 > 0 else "#00FF00"
                 st.markdown(f"**{row.名稱} ({row.代號})**: {row.訊號} <span style='color:#888'>({row.理由})</span><br>${row.現價} (<span style='color:{color}'>{row.漲幅}%</span>)", unsafe_allow_html=True)
-        else: st.info("庫存無資料")
+        else: st.info("庫存暫無資料")
 
     st.divider()
     
-    # 永遠固定的分頁
-    t1, t2, t3 = st.tabs(["📈 多方排行", "📉 空方排行", "全部列表"])
+    # 分頁設定：確保「全部」都有資料
+    t1, t2, t3 = st.tabs(["📈 多方排行 (紅)", "📉 空方排行 (綠)", "全部列表"])
     cols = ['名稱', '現價', '漲幅', '訊號', '理由']
     
     with t1:
-        d1 = df_show[df_show['漲幅'] > 0].sort_values('漲幅', ascending=False)
-        st.dataframe(d1, column_order=cols, use_container_width=True, hide_index=True)
+        # 只要 >= 0 就列出來，絕對不隱藏
+        d1 = df_show[df_show['漲幅'] >= 0].sort_values('漲幅', ascending=False)
+        if d1.empty: st.info("目前無上漲股票")
+        else: st.dataframe(d1, column_order=cols, use_container_width=True, hide_index=True)
     with t2:
+        # 只要 < 0 就列出來
         d2 = df_show[df_show['漲幅'] < 0].sort_values('漲幅', ascending=True)
-        st.dataframe(d2, column_order=cols, use_container_width=True, hide_index=True)
+        if d2.empty: st.info("目前無下跌股票")
+        else: st.dataframe(d2, column_order=cols, use_container_width=True, hide_index=True)
     with t3:
-        st.dataframe(df_show, column_order=cols, use_container_width=True, hide_index=True)
+        st.dataframe(df_show.sort_values('漲幅', ascending=False), column_order=cols, use_container_width=True, hide_index=True)
 else:
-    st.info("🐕 總柴正在暖身中，請稍候...")
+    st.info("🐕 總柴正在努力連線中... (開機自動載入)")
 
-# 自動刷新 (5分鐘)
 if auto_refresh:
     time.sleep(300)
     st.rerun()
