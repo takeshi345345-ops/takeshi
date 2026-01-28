@@ -5,3 +5,4 @@ twstock
 requests
 lxml
 finmind
+tqdm
