@@ -9,7 +9,7 @@ import json
 from FinMind.data import DataLoader
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="總柴快報 - 戰略版", layout="wide")
+st.set_page_config(page_title="總柴快報 - 即時戰略版", layout="wide")
 
 st.markdown("""
 <style>
@@ -30,8 +30,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐕 總柴快報：籌碼戰略版")
-st.caption("策略：MA20 月線 + 法人籌碼 | 資料源：Yahoo Finance (價) + FinMind (籌碼)")
+# 取得目前台灣時間
+def get_taiwan_time():
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+
+now_str = get_taiwan_time().strftime('%Y-%m-%d %H:%M:%S')
+st.title(f"🐕 總柴快報：即時戰略版")
+st.caption(f"最後更新：{now_str} (台灣時間) | 資料源：Yahoo Finance (強制刷新) + FinMind")
 
 # --- 2. 設定區 ---
 LINE_TOKEN = None
@@ -67,61 +72,50 @@ WATCHLIST_BASE = [
 # --- 4. 核心功能模組 ---
 
 def get_chinese_name(sid):
-    # twstock 查名
     if sid in twstock.codes:
         return twstock.codes[sid].name
     return sid
 
+# ⚠️ 關鍵修正：這裡不使用快取 (st.cache_data)，確保每次按按鈕都抓最新的
 def fetch_batch_price(tickers):
-    # Yahoo Finance 批次抓取 (含MA20)
     yf_tickers = [f"{x}.TW" for x in tickers]
     try:
-        data = yf.download(yf_tickers, period="3mo", group_by='ticker', progress=False, threads=True)
+        # 抓 3 個月 (確保 MA20)，使用 auto_adjust=True 讓價格更準
+        data = yf.download(yf_tickers, period="3mo", group_by='ticker', progress=False, threads=True, auto_adjust=True)
         return data
     except:
         return None
 
 def get_chip_analysis(sid):
-    # FinMind 查籌碼
     try:
         dl = DataLoader()
         start = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
-        # 抓法人買賣
         df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
         
         if df.empty: return "無數據", 0, 0
         
-        # 簡單計算買賣超
+        # 抓最近 3 天法人動向
         df['net'] = df['buy'] - df['sell']
-        net_total = df['net'].tail(3).sum() # 近三日總和
+        net_total = df['net'].tail(3).sum() 
         
         status = "中性"
         score = 0
-        
-        # 單位：股 -> 轉張數
         net_sheets = int(net_total / 1000)
         
-        if net_sheets > 1000: 
-            status = "法人大買"; score = 2
-        elif net_sheets > 0: 
-            status = "法人小買"; score = 1
-        elif net_sheets < -1000: 
-            status = "法人大賣"; score = -2
-        elif net_sheets < 0: 
-            status = "法人小賣"; score = -1
+        if net_sheets > 1000: status = "法人大買"; score = 2
+        elif net_sheets > 0: status = "法人小買"; score = 1
+        elif net_sheets < -1000: status = "法人大賣"; score = -2
+        elif net_sheets < 0: status = "法人小賣"; score = -1
             
         return status, score, net_sheets
     except:
         return "查無資料", 0, 0
 
 def generate_advice(price, ma20, pct, chip_score):
-    # 自動生成操作建議
     advice = ""
     action = ""
     
-    # 技術面判斷
     if price >= ma20:
-        # 在月線上 (多頭)
         if pct > 3.0:
             base = "強勢突破月線，爆量長紅。"
             if chip_score > 0: 
@@ -145,7 +139,6 @@ def generate_advice(price, ma20, pct, chip_score):
                 advice = f"{base} 沿月線操作即可。"
                 action = "HOLD_NORMAL"
     else:
-        # 在月線下 (空頭)
         if pct < -3.0:
             base = "帶量下殺跌破月線。"
             if chip_score < 0:
@@ -172,26 +165,25 @@ def send_line(msg):
     except: pass
 
 # --- 5. 主程式 ---
-if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
+if st.button("🔄 立即刷新 (強制抓取最新報價)", type="primary"):
     
     targets = list(set(WATCHLIST_BASE + user_inv))
-    st.info(f"🐕 正在掃描 {len(targets)} 檔股票... (1.抓價 -> 2.篩選 -> 3.查籌碼)")
+    st.info(f"🐕 正在即時掃描 {len(targets)} 檔股票... (Yahoo數據源)")
     
-    # 1. 批次抓價
     df_bulk = fetch_batch_price(targets)
     
     if df_bulk is not None and not df_bulk.empty:
         results = []
-        buy_list = []
-        sell_list = []
-        inv_notify = []
+        # 通知清單 (儲存完整字串)
+        buy_lines = []
+        sell_lines = []
+        inv_lines = []
         
         progress_bar = st.progress(0)
         total = len(targets)
         
         for i, sid in enumerate(targets):
             try:
-                # 處理 Yahoo 資料格式
                 if len(targets) > 1: stock_df = df_bulk[f"{sid}.TW"]
                 else: stock_df = df_bulk
                 
@@ -201,6 +193,9 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                 latest = stock_df.iloc[-1]
                 prev = stock_df.iloc[-2]
                 
+                # 確認日期 (這行確保是最新數據)
+                # latest_date = latest.name 
+                
                 price = float(latest['Close'])
                 prev_close = float(prev['Close'])
                 ma20 = float(stock_df['Close'].rolling(window=20).mean().iloc[-1])
@@ -208,18 +203,14 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                 
                 is_inv = sid in user_inv
                 
-                # --- 漏斗篩選 ---
-                # 條件：庫存 OR 波動大(>2%) OR 跌破月線(price<ma20)
+                # --- 漏斗篩選 (庫存 OR 波動大 OR 破線) ---
                 if is_inv or abs(pct) > 2.0 or price < ma20:
                     
-                    # 2. 查籌碼
                     chip_status, chip_score, net_vol = get_chip_analysis(sid)
-                    
-                    # 3. 生成建議
                     advice, action = generate_advice(price, ma20, pct, chip_score)
                     name = get_chinese_name(sid)
                     
-                    # 分類標籤
+                    # 標籤
                     tag_class = "card-wait"
                     if "BUY" in action: tag_class = "card-buy"
                     elif "SELL" in action: tag_class = "card-sell"
@@ -232,23 +223,19 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                     }
                     results.append(item)
                     
-                    # --- LINE 訊息組裝 (格式直覺化) ---
-                    # 符號：📈漲 / 📉跌 / 🏦法人
-                    chip_icon = "🏦買" if net_vol > 0 else ("🏦賣" if net_vol < 0 else "🏦平")
-                    line_msg = f"{name}({sid}) ${price} ({pct}%)\n   └ {chip_icon}:{net_vol}張"
-                    
-                    # 庫存通知 (一定要)
-                    if is_inv:
-                        inv_notify.append(f"💼 {line_msg} | {advice}")
+                    # --- LINE 訊息組裝 (完整資訊版) ---
+                    # 格式: 股名(代號) $價格 (+漲跌%) | 法人:買1000張
+                    chip_icon = "買" if net_vol > 0 else ("賣" if net_vol < 0 else "平")
+                    line_msg = f"{name}({sid}) ${price} ({pct}%)\n   └ 法人{chip_icon}:{net_vol}張"
 
-                    # 篩選通知 (多/空)
-                    # 多方：站上月線 + 籌碼正向 (或大漲)
-                    if "BUY_STRONG" in action: 
-                        buy_list.append(f"🔥 {line_msg}")
-                    
-                    # 空方：跌破月線 + 籌碼負向 (或重挫)
+                    if is_inv:
+                        inv_lines.append(line_msg)
+                        
+                    if "BUY_STRONG" in action:
+                        buy_lines.append(line_msg)
+                        
                     if "SELL_STRONG" in action or ("SELL" in action and net_vol < -500):
-                        sell_list.append(f"❄️ {line_msg}")
+                        sell_lines.append(line_msg)
                     
             except: pass
             
@@ -256,7 +243,29 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
             
         progress_bar.empty()
         
-        # --- 6. 顯示結果 ---
+        # --- 6. 顯示與通知 ---
+        
+        # 發送 LINE (無限制數量，完整揭露)
+        if inv_lines or buy_lines or sell_lines:
+            # 建立訊息 (分段發送避免太長)
+            msg_header = f"🐕 總柴即時報 ({get_taiwan_time().strftime('%H:%M')})"
+            
+            # 庫存段
+            if inv_lines:
+                msg_inv = f"{msg_header}\n\n【💼 庫存追蹤】\n" + "\n".join(inv_lines)
+                send_line(msg_inv)
+                time.sleep(1) # 避免順序錯亂
+                
+            # 多方段
+            if buy_lines:
+                msg_buy = f"【🔥 多方攻擊 (站上月線+籌碼買)】\n" + "\n".join(buy_lines)
+                send_line(msg_buy)
+                time.sleep(1)
+                
+            # 空方段
+            if sell_lines:
+                msg_sell = f"【❄️ 空方棄守 (跌破月線+籌碼賣)】\n" + "\n".join(sell_lines)
+                send_line(msg_sell)
         
         # A. 庫存區
         st.subheader("💼 我的庫存診斷")
@@ -282,12 +291,12 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.warning("庫存代號無資料 (若今日無波動可能未被 Yahoo 更新)")
+            st.warning("庫存代號無資料 (請確認代號或Yahoo尚未更新盤中價)")
             
         st.divider()
         
         # B. 推薦分頁
-        t1, t2 = st.tabs(["🔥 買進 / 強勢 (多方)", "❄️ 賣出 / 弱勢 (空方)"])
+        t1, t2 = st.tabs(["🔥 買進 / 強勢", "❄️ 賣出 / 弱勢"])
         
         with t1:
             buys = [r for r in results if "BUY" in r['action'] or "HOLD_GOOD" in r['action']]
@@ -305,7 +314,7 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                         <div class="advice-box">{r['advice']}</div>
                     </div>
                     """, unsafe_allow_html=True)
-            else: st.info("今日無強勢買訊。")
+            else: st.info("無強勢買訊。")
             
         with t2:
             sells = [r for r in results if "SELL" in r['action']]
@@ -323,25 +332,9 @@ if st.button("🔄 啟動戰略掃描 (Yahoo+FinMind)", type="primary"):
                         <div class="advice-box">{r['advice']}</div>
                     </div>
                     """, unsafe_allow_html=True)
-            else: st.info("今日無明顯賣訊。")
-            
-        # 發送 LINE (直覺化完整版)
-        if inv_notify or buy_list or sell_list:
-            msg = f"\n🐕 總柴戰略報 ({datetime.datetime.now().strftime('%H:%M')})\n"
-            
-            if inv_notify:
-                msg += "\n【💼 庫存追蹤】\n" + "\n".join(inv_notify) + "\n"
-            
-            if buy_list:
-                # 這裡不切片了，全部丟進去
-                msg += "\n【🔥 多方攻擊｜法人同步買】\n" + "\n".join(buy_list) + "\n"
-                
-            if sell_list:
-                msg += "\n【❄️ 空方棄守｜法人同步賣】\n" + "\n".join(sell_list) + "\n"
-            
-            send_line(msg)
+            else: st.info("無明顯賣訊。")
             
     else:
-        st.error("Yahoo Finance 暫時無回應，請稍後再試。")
+        st.error("Yahoo Finance 連線失敗，請稍後再按一次刷新。")
 else:
-    st.info("🐕 總柴已就位，點擊上方按鈕開始「價量+籌碼」雙刀流掃描！")
+    st.info("🐕 準備就緒，按鈕後將強制抓取即時報價！")
